@@ -1,6 +1,6 @@
 # Live Stream Forwarder
 ## Overview
-# Live Stream Forwarder (formly streamlink-go) is a tool that converts website live streams into local live broadcast services for video players (e.g. VLC or PotPlayer) directly access.
+Live Stream Forwarder (formly streamlink-go) is a tool that converts website live streams into local live broadcast services for video players (e.g. VLC or PotPlayer) directly access.
 ## Supported Live Streaming Platform
 | Platform                                         | URL token |
 |--------------------------------------------------|-----------|
