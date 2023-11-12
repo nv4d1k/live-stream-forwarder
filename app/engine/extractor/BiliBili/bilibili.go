@@ -133,13 +133,13 @@ func (l *Link) getLinkByAPIv2() (*url.URL, error) {
 }
 
 func (l *Link) GetLink() (*url.URL, error) {
-	/*log := global.Log.WithField("function", "app.engine.extractor.BiliBili.GetLink")
+	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.GetLink")
 	u, err := l.getLinkByAPIv1()
 	if err == nil {
 		return u, nil
 	}
-	log.Errorf("trying get stream by api v1 error: %s\n", err.Error())*/
-	u, err := l.getLinkByAPIv2()
+	log.Errorf("trying get stream by api v1 error: %s\n", err.Error())
+	u, err = l.getLinkByAPIv2()
 	if err != nil {
 		return nil, fmt.Errorf("trying get stream by api v2 error: %w", err)
 	}

@@ -114,10 +114,10 @@ func init() {
 
 	rootCmd.SetVersionTemplate(fmt.Sprintf(`{{with .Name}}{{printf "%%s version information: " .}}{{end}}
    {{printf "Version:    %%s" .Version}}
-   Build Time: %s
-   Git Revision: %s
-   Go version: %s
-   OS/Arch:    %s/%s
+   Build Time:		%s
+   Git Revision:	%s
+   Go version:		%s
+   OS/Arch:			%s/%s
 `, global.BuildTime, global.GitCommit, runtime.Version(), runtime.GOOS, runtime.GOARCH))
 }
 
