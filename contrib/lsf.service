@@ -1,0 +1,11 @@
+[Unit]
+Description=Live Stream Forwarder
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+ExecStart=/usr/local/bin/lsf --log-level 3 --log-file /var/log/lsf.log
+
+[Install]
+WantedBy=multi-user.target
