@@ -3,7 +3,7 @@ package controllers
 import (
 	"fmt"
 	"github.com/gin-gonic/gin"
-	BiliBili "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/Bilibili"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/BiliBili"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/DouYin"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/DouYu"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/HuYa"
@@ -38,15 +38,18 @@ func Forwarder(c *gin.Context) {
 	if proxyURL != nil {
 		log.WithField("field", "proxy").Debug(proxyURL.String())
 	}
+	log = log.WithField("platform", strings.ToLower(c.Param("platform"))).WithField("room", c.Param("room"))
 	switch strings.ToLower(c.Param("platform")) {
 	case "douyu":
 		dy, err := DouYu.NewDouyuLink(c.Param("room"), proxyURL)
 		if err != nil {
+			log.Errorf("create link object error: %s\n", err.Error())
 			c.String(400, err.Error())
 			return
 		}
 		u, err := dy.GetLink()
 		if err != nil {
+			log.Errorf("get link error: %s\n", err.Error())
 			c.String(400, err.Error())
 			return
 		}
@@ -55,6 +58,7 @@ func Forwarder(c *gin.Context) {
 			f := httpweb.NewHTTPWebForwarder(proxyURL, false)
 			err = f.Forward(c, make(http.Header), u.String(), 0)
 			if err != nil {
+				log.Errorf("forward http(s) stream error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
@@ -62,6 +66,7 @@ func Forwarder(c *gin.Context) {
 			f := websocket.NewWebSocketForwarder(proxyURL, false)
 			err = f.Start(c, u.String())
 			if err != nil {
+				log.Errorf("forward ws(s) stream error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
@@ -82,11 +87,13 @@ func Forwarder(c *gin.Context) {
 		if pp == "" {
 			link, err := HuYa.NewHuyaLink(c.Param("room"), proxyURL)
 			if err != nil {
+				log.Errorf("create link object error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
 			u, err := link.GetLink()
 			if err != nil {
+				log.Errorf("get link error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
@@ -95,6 +102,7 @@ func Forwarder(c *gin.Context) {
 				p := hls.NewHLSForwarder(proxyURL, true)
 				err := p.WrapPlaylist(c, u.String(), prefix)
 				if err != nil {
+					log.Errorf("wrap play list error: %s\n", err.Error())
 					c.String(400, err.Error())
 					return
 				}
@@ -102,6 +110,7 @@ func Forwarder(c *gin.Context) {
 				p := httpweb.NewHTTPWebForwarder(proxyURL, true)
 				err = p.Forward(c, make(http.Header), u.String(), 0)
 				if err != nil {
+					log.Errorf("forward http(s) stream error: %s\n", err.Error())
 					c.String(500, err.Error())
 					return
 				}
@@ -113,6 +122,7 @@ func Forwarder(c *gin.Context) {
 			p := hls.NewHLSForwarder(proxyURL, true)
 			err := p.Forward(c, pp, prefix)
 			if err != nil {
+				log.Errorf("forward hls stream error: %s\n", err.Error())
 				c.String(400, err.Error())
 				return
 			}
@@ -130,17 +140,20 @@ func Forwarder(c *gin.Context) {
 		if pp == "" {
 			link, err := Twitch.NewTwitchLink(c.Param("room"), proxyURL)
 			if err != nil {
+				log.Errorf("create link object error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
 			url, err := link.GetLink()
 			if err != nil {
+				log.Errorf("get link error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
 			p := hls.NewHLSForwarder(proxyURL, false)
 			err = p.ForwardM3u8(c, url.String(), prefix)
 			if err != nil {
+				log.Errorf("forward playlist error: %s\n", err.Error())
 				c.String(400, err.Error())
 				return
 			}
@@ -148,6 +161,7 @@ func Forwarder(c *gin.Context) {
 			p := hls.NewHLSForwarder(proxyURL, false)
 			err := p.Forward(c, pp, prefix)
 			if err != nil {
+				log.Errorf("forward hls stream error: %s\n", err.Error())
 				c.String(400, err.Error())
 				return
 			}
@@ -167,11 +181,13 @@ func Forwarder(c *gin.Context) {
 		if pp == "" {
 			link, err := BiliBili.NewBiliBiliLink(c.Param("room"), proxyURL)
 			if err != nil {
+				log.Errorf("create link object error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
 			u, err := link.GetLink()
 			if err != nil {
+				log.Errorf("get link error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
@@ -180,6 +196,7 @@ func Forwarder(c *gin.Context) {
 				p := hls.NewHLSForwarder(proxyURL, false)
 				err := p.WrapPlaylist(c, u.String(), prefix)
 				if err != nil {
+					log.Errorf("wrap play list error: %s\n", err.Error())
 					c.String(400, err.Error())
 					return
 				}
@@ -187,6 +204,7 @@ func Forwarder(c *gin.Context) {
 				p := httpweb.NewHTTPWebForwarder(proxyURL, false)
 				err = p.Forward(c, headers, u.String(), 0)
 				if err != nil {
+					log.Errorf("forward http(s) stream error: %s\n", err.Error())
 					c.String(500, err.Error())
 					return
 				}
@@ -198,6 +216,7 @@ func Forwarder(c *gin.Context) {
 			p := hls.NewHLSForwarder(proxyURL, false)
 			err := p.Forward(c, pp, prefix)
 			if err != nil {
+				log.Errorf("forward hls stream error: %s\n", err.Error())
 				c.String(400, err.Error())
 				return
 			}
@@ -215,11 +234,13 @@ func Forwarder(c *gin.Context) {
 		if pp == "" {
 			link, err := DouYin.NewDouYinLink(c.Param("room"), proxyURL)
 			if err != nil {
+				log.Errorf("create link object error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
 			u, err := link.GetLink()
 			if err != nil {
+				log.Errorf("get link error: %s\n", err.Error())
 				c.String(500, err.Error())
 				return
 			}
@@ -228,6 +249,7 @@ func Forwarder(c *gin.Context) {
 				p := hls.NewHLSForwarder(proxyURL, false)
 				err := p.WrapPlaylist(c, u.String(), prefix)
 				if err != nil {
+					log.Errorf("wrap play list error: %s\n", err.Error())
 					c.String(400, err.Error())
 					return
 				}
@@ -235,6 +257,7 @@ func Forwarder(c *gin.Context) {
 				p := httpweb.NewHTTPWebForwarder(proxyURL, false)
 				err = p.Forward(c, make(http.Header), u.String(), 0)
 				if err != nil {
+					log.Errorf("forward http(s) stream error: %s\n", err.Error())
 					c.String(500, err.Error())
 					return
 				}
@@ -246,6 +269,7 @@ func Forwarder(c *gin.Context) {
 			p := hls.NewHLSForwarder(proxyURL, false)
 			err := p.Forward(c, pp, prefix)
 			if err != nil {
+				log.Errorf("forward hls stream error: %s\n", err.Error())
 				c.String(400, err.Error())
 				return
 			}

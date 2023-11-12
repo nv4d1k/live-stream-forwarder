@@ -18,7 +18,7 @@ type Link struct {
 }
 
 func NewBiliBiliLink(rid string, proxy *url.URL) (bili *Link, err error) {
-	log := global.Log.WithField("function", "app.engine.extractor.Bilibili.NewBiliBiliLink")
+	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.NewBiliBiliLink")
 	bili = new(Link)
 	bili.rid = rid
 	if proxy != nil {
@@ -35,7 +35,7 @@ func NewBiliBiliLink(rid string, proxy *url.URL) (bili *Link, err error) {
 }
 
 func (l *Link) getRoomStatus() error {
-	log := global.Log.WithField("function", "app.engine.extractor.Bilibili.getRoomStatus")
+	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.getRoomStatus")
 	resp, err := l.client.Get(fmt.Sprintf("https://api.live.bilibili.com/room/v1/Room/room_init?id=%s", l.rid))
 	if err != nil {
 		return fmt.Errorf("get room init info error: %w", err)
@@ -57,7 +57,7 @@ func (l *Link) getRoomStatus() error {
 }
 
 func (l *Link) GetLink() (*url.URL, error) {
-	log := global.Log.WithField("function", "app.engine.extractor.Bilibili.GetLink")
+	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.GetLink")
 	u, err := url.Parse("https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo")
 	if err != nil {
 		return nil, fmt.Errorf("parsing room play info url error: %w", err)
