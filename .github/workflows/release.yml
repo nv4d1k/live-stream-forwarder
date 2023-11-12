@@ -21,4 +21,4 @@ jobs:
           goarch: ${{ matrix.goarch }}
           binary_name: "lsf"
           extra_files: contrib README.md LICENSE.txt
-          ldflags: -X github.com/nv4d1k/live-stream-forwarder/global.Version=${{github.ref_name}} -X github.com/nv4d1k/live-stream-forwarder/global.BuildTime="${{ steps.date.outputs.date }}"
+          ldflags: -X 'github.com/nv4d1k/live-stream-forwarder/global.Version=${{github.ref_name}}' -X 'github.com/nv4d1k/live-stream-forwarder/global.BuildTime="${{ steps.date.outputs.date }}"'
