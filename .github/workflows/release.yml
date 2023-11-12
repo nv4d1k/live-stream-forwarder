@@ -11,14 +11,17 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v3
-      - name: Get current date
-        id: date
-        run: echo "current_time=$(date +'%Y-%m-%d %H:%M:%S')"
+      - name: Set APP_VERSION env
+        run: echo APP_VERSION=$(echo ${GITHUB_REF} | rev | cut -d'/' -f 1 | rev ) >> ${GITHUB_ENV}
+      - name: Set BUILD_TIME env
+        run: echo BUILD_TIME=$(date +'%Y-%m-%d %H:%M:%S') >> ${GITHUB_ENV}
+      - name: Set INPUT_LDFLAGS env
+        run: echo INPUT_LDFLAGS=-X \"github.com/nv4d1k/live-stream-forwarder/global.Version=${{env.APP_VERSION}}\" -X \"github.com/nv4d1k/live-stream-forwarder/global.BuildTime=${{env.BUILD_TIME}}\" >> ${GITHUB_ENV}
       - uses: wangyoucao577/go-release-action@v1.40
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
+          build_flags: -v
           binary_name: "lsf"
           extra_files: contrib README.md LICENSE.txt
-          ldflags: "-X \"github.com/nv4d1k/live-stream-forwarder/global.Version=${{github.ref_name}}\" -X \"github.com/nv4d1k/live-stream-forwarder/global.BuildTime=$current_time\""
