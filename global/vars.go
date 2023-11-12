@@ -5,6 +5,7 @@ import "github.com/sirupsen/logrus"
 var (
 	Version   string
 	BuildTime string
+	GitCommit string
 )
 
 var (
