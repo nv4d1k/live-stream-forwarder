@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -31,8 +32,9 @@ var (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "lsf",
-	Short: "Live Stream Forwarder",
+	Use:     "lsf",
+	Short:   "Live Stream Forwarder",
+	Version: global.Version,
 	/*Long: `A longer description that spans multiple lines and likely contains
 	examples and usage of using your application. For example:
 
@@ -109,6 +111,13 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&proxy, "proxy", "", "proxy url")
 	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", "", "logging file")
 	rootCmd.PersistentFlags().Uint32Var(&global.LogLevel, "log-level", 3, "log level (0 - 7, 3 = warn , 6 = debug)")
+
+	rootCmd.SetVersionTemplate(fmt.Sprintf(`{{with .Name}}{{printf "%%s version information: " .}}{{end}}
+   {{printf "Version:    %%s" .Version}}
+   Build Time: %s
+   Go version: %s
+   OS/Arch:    %s/%s
+`, global.BuildTime, runtime.Version(), runtime.GOOS, runtime.GOARCH))
 }
 
 func initConfig() {
