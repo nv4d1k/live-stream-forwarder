@@ -11,6 +11,9 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v3
+      - name: Get current date
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d %H:%M:%S')"
       - uses: wangyoucao577/go-release-action@v1.40
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -18,4 +21,4 @@ jobs:
           goarch: ${{ matrix.goarch }}
           binary_name: "lsf"
           extra_files: contrib README.md LICENSE.txt
-          ldflags: -X github.com/nv4d1k/live-stream-forwarder/global.Version=${{github.ref_name}} -X github.com/nv4d1k/live-stream-forwarder/global.BuildTime=`date +'%Y-%m-%d %H:%M:%S'`
+          ldflags: -X github.com/nv4d1k/live-stream-forwarder/global.Version=${{github.ref_name}} -X github.com/nv4d1k/live-stream-forwarder/global.BuildTime="${{ steps.date.outputs.date }}"
