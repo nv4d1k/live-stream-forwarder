@@ -37,6 +37,7 @@ func NewDouYinLink(rid string, proxy *url.URL) (douyin *Link, err error) {
 }
 
 func (l *Link) getCookies() error {
+	log := global.Log.WithField("func", "app.engine.extractor.DouYin.getCookies")
 	req1, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/%s", l.rid), nil)
 	if err != nil {
 		return fmt.Errorf("making request for get __ac_nonce error: %w", err)
@@ -47,6 +48,7 @@ func (l *Link) getCookies() error {
 		return fmt.Errorf("get __ac_nonce error: %w", err)
 	}
 	defer resp1.Body.Close()
+	log.WithField("field", "got __ac_nonce headers").Debug(resp1.Header)
 	re := regexp.MustCompile(`(?i)__ac_nonce=([0-9a-f]*?);`)
 	acNonce := re.FindStringSubmatch(resp1.Header.Get("Set-Cookie"))[1]
 	if len(acNonce) <= 0 {
@@ -65,6 +67,7 @@ func (l *Link) getCookies() error {
 		return fmt.Errorf("get ttwid error: %w", err)
 	}
 	defer resp2.Body.Close()
+	log.WithField("field", "got ttwid headers").Debug(resp2.Header)
 	re2 := regexp.MustCompile(`(?i)ttwid=(\S*);`)
 	ttwid := re2.FindStringSubmatch(resp2.Header.Get("Set-Cookie"))[1]
 	if len(ttwid) <= 0 {
@@ -75,6 +78,7 @@ func (l *Link) getCookies() error {
 }
 
 func (l *Link) GetLink() (*url.URL, error) {
+	log := global.Log.WithField("func", "app.engine.extractor.DouYin.GetLink")
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/webcast/room/web/enter/?aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&screen_width=1728&screen_height=1117&browser_language=zh-CN&browser_platform=Windows&browser_name=Chrome&browser_version=117.0.0.0&web_rid=%s", l.rid), nil)
 	if err != nil {
 		return nil, fmt.Errorf("making request for get link error: %w", err)
@@ -92,6 +96,7 @@ func (l *Link) GetLink() (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing response body error: %w", err)
 	}
+	log.WithField("field", "room json data").Debug(string(body))
 	data := gjson.GetBytes(body, "data.data.0")
 	if data.Get("status").Int() != 2 {
 		return nil, fmt.Errorf("room status error: status %d", data.Get("status").Int())
@@ -101,6 +106,7 @@ func (l *Link) GetLink() (*url.URL, error) {
 		n int64 = -1
 		u string
 	)
+	log.WithField("field", "stream data").Debug(stream.Raw)
 	stream.Get("data").ForEach(func(key, value gjson.Result) bool {
 		sdkParams := gjson.Parse(value.Get("main.sdk_params").String())
 		if l.calcStreamWeight(sdkParams.Get("vbitrate").Int(), sdkParams.Get("resolution").String()) > n {
