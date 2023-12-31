@@ -114,8 +114,8 @@ func (l *Link) getLinkByAPIv2() (*url.URL, error) {
 	parsestr = "#.format.#.codec.#|@flatten"
 	if len(streamsdata.Get("#.format.#.codec.#(current_qn>=10000)|@flatten").Array()) > 0 {
 		parsestr = "#.format.#.codec.#(current_qn>=10000)|@flatten"
-	} else if len(streamsdata.Get("#.format.#.codec.#(current_qn>=250)|@flatten").Array()) > 0 {
-		parsestr = "#.format.#.codec.#(current_qn>=250)|@flatten"
+	} else if len(streamsdata.Get("#.format.#.codec.#(current_qn>=80)|@flatten").Array()) > 0 {
+		parsestr = "#.format.#.codec.#(current_qn>=80)|@flatten"
 	}
 	streamsdata.Get(parsestr).ForEach(func(ck, ci gjson.Result) bool {
 		ci.Get("url_info").ForEach(func(uk, ui gjson.Result) bool {
@@ -127,6 +127,9 @@ func (l *Link) getLinkByAPIv2() (*url.URL, error) {
 	log.WithField("field", "parsed url").Debug(strings.Join(urls, "\n"))
 	if len(urls) <= 0 {
 		return nil, errors.New("no streams found")
+	}
+	if len(urls) == 1 {
+		return url.Parse(urls[0])
 	}
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 	return url.Parse(urls[r.Intn(len(urls)-1)])

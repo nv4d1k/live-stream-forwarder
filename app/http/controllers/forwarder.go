@@ -20,6 +20,7 @@ import (
 
 func Forwarder(c *gin.Context) {
 	log := global.Log.WithField("function", "app.http.controllers.Forwarder")
+	log.WithField("http request", "headers").Debug(c.Request.Header)
 	proxy := c.GetString("proxy")
 	var proxyURL *url.URL
 	var err error
@@ -82,6 +83,9 @@ func Forwarder(c *gin.Context) {
 			if c.Request.TLS != nil {
 				return "https"
 			}
+			if c.Request.Header.Get("X-Forwarded-Proto") == "https" {
+				return "https"
+			}
 			return "http"
 		}(), c.Request.Host, c.Request.URL.Path)
 		if pp == "" {
@@ -135,6 +139,9 @@ func Forwarder(c *gin.Context) {
 			if c.Request.TLS != nil {
 				return "https"
 			}
+			if c.Request.Header.Get("X-Forwarded-Proto") == "https" {
+				return "https"
+			}
 			return "http"
 		}(), c.Request.Host, c.Request.URL.Path)
 		if pp == "" {
@@ -172,6 +179,9 @@ func Forwarder(c *gin.Context) {
 		pp := c.DefaultQuery("url", "")
 		prefix := fmt.Sprintf("%s://%s%s", func() string {
 			if c.Request.TLS != nil {
+				return "https"
+			}
+			if c.Request.Header.Get("X-Forwarded-Proto") == "https" {
 				return "https"
 			}
 			return "http"
@@ -227,6 +237,9 @@ func Forwarder(c *gin.Context) {
 		pp := c.DefaultQuery("url", "")
 		prefix := fmt.Sprintf("%s://%s%s", func() string {
 			if c.Request.TLS != nil {
+				return "https"
+			}
+			if c.Request.Header.Get("X-Forwarded-Proto") == "https" {
 				return "https"
 			}
 			return "http"
