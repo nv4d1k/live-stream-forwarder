@@ -62,6 +62,7 @@ func (l *Link) getCookies() error {
 	}
 	req2.Header.Set("Upgrade-Insecure-Requests", "1")
 	req2.AddCookie(l.cookies)
+	log.WithField("field", "sending headers").Debug(req2.Header)
 	resp2, err := l.client.Do(req2)
 	if err != nil {
 		return fmt.Errorf("get ttwid error: %w", err)

@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -72,8 +73,10 @@ func (l *Link) GetLink() (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get rate stream error: %w", err)
 	}
+	streamID := strings.Split(filepath.Base(data.Get("data.rtmp_live").String()), ".")[0]
 	uuid, _ := uuid.NewUUID()
 	s := rand.New(rand.NewSource(time.Now().Unix()))
+	playID := l.t13 + "-" + strconv.Itoa(int(math.Floor(s.Float64()*999999998))) + "1"
 	switch data.Get("data.p2p").Int() {
 	case 0:
 		return url.Parse(fmt.Sprintf("%s/%s", data.Get("data.rtmp_url").String(), data.Get("data.rtmp_live").String()))
@@ -100,11 +103,40 @@ func (l *Link) GetLink() (*url.URL, error) {
 		return url.Parse(strings.ReplaceAll(u.String(), ".flv", ".xs"))
 	case 9, 10:
 		u := fmt.Sprintf("wss://%s/%s/live/%s&delay=%s&playid=%s&uuid=%s&txSecret=%s&txTime=%s",
-			data.Get("data.p2pMeta.dyxp2p_sug_egde").String(),
-			data.Get("data.p2pMeta.dyxp2p_domain").String(),
+			func() string {
+				if data.Get("data.p2pMeta.dyxp2p_sug_egde").Exists() {
+					return data.Get("data.p2pMeta.dyxp2p_sug_egde").String()
+				}
+				hostURL := fmt.Sprintf("https://%s/%s.xs?playid=%s&uuid=%s",
+					data.Get("data.p2pMeta.xp2p_api_domain").String(),
+					streamID,
+					playID,
+					uuid.String(),
+				)
+				log.WithField("field", "host url").Debug(hostURL)
+				getHostBodyResp, err := l.client.Get(hostURL)
+				if err != nil {
+					log.WithField("field", "get host body error").Errorln(err.Error())
+					return ""
+				}
+				defer getHostBodyResp.Body.Close()
+				hostBody, err := io.ReadAll(getHostBodyResp.Body)
+				if err != nil {
+					log.WithField("field", "parse host body error").Errorln(err.Error())
+					return ""
+				}
+				log.WithField("field", "host body").Debug(string(hostBody))
+				return gjson.GetBytes(hostBody, "sug").Array()[0].String()
+			}(),
+			func() string {
+				if data.Get("data.p2pMeta.dyxp2p_domain").Exists() {
+					return data.Get("data.p2pMeta.dyxp2p_domain").String()
+				}
+				return data.Get("data.p2pMeta.xp2p_domain").String()
+			}(),
 			data.Get("data.rtmp_live").String(),
 			data.Get("data.p2pMeta.xp2p_txDelay").String(),
-			l.t13+"-"+strconv.Itoa(int(math.Floor(s.Float64()*999999998)))+"1",
+			playID,
 			uuid.String(),
 			data.Get("data.p2pMeta.xp2p_txSecret").String(),
 			data.Get("data.p2pMeta.xp2p_txTime").String())
