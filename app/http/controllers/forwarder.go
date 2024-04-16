@@ -251,7 +251,7 @@ func Forwarder(c *gin.Context) {
 				c.String(500, err.Error())
 				return
 			}
-			u, err := link.GetLink()
+			u, err := link.GetLink(c.DefaultQuery("format", "hls"))
 			if err != nil {
 				log.Errorf("get link error: %s\n", err.Error())
 				c.String(500, err.Error())
