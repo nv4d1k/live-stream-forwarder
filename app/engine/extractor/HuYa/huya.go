@@ -185,7 +185,7 @@ func (l *Link) getRoomInfo() (err error) {
 	if err != nil {
 		return
 	}
-	re := regexp.MustCompile(`<script> window.HNF_GLOBAL_INIT = (.*) </script>`)
+	re := regexp.MustCompile(`<script> window.HNF_GLOBAL_INIT = ((.|\n)*) </script>`)
 	result := re.FindStringSubmatch(string(body))
 	if len(result) < 2 {
 		return errors.New("HNF_GLOBAL_INIT not found")
