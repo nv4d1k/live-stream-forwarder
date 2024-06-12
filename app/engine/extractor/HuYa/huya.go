@@ -6,9 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/dop251/goja"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"io"
-	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -108,10 +108,12 @@ func (l *Link) getAnonymousUID() (err error) {
 }
 
 func (l *Link) getLive() (string, error) {
+	log := global.Log.WithField("function", "app.engine.extractor.HuYa.getLive")
 	var (
 		stream_info []string
 	)
 	l.res.Get("roomInfo.tLiveInfo.tLiveStreamInfo.vStreamInfo.value").ForEach(func(key, value gjson.Result) bool {
+		fmt.Println(value.Raw)
 		if value.Get("sFlvUrl").Exists() {
 			anticode, err := l.processAntiCode(value.Get("sFlvAntiCode").String(), value.Get("sStreamName").String())
 			if err != nil {
@@ -190,8 +192,44 @@ func (l *Link) getRoomInfo() (err error) {
 	if len(result) < 2 {
 		return errors.New("HNF_GLOBAL_INIT not found")
 	}
-	log.WithField("field", "room info").Debug(result[1])
-	l.res = gjson.Parse(result[1])
+	log.WithField("HNF_GLOBAL_INIT", result[1]).Debugln("extract room info")
+	vm := goja.New()
+	_, err = vm.RunString(fmt.Sprintf(`
+function init(){
+	var obj = %s;
+	var json = JSON.stringify(obj, function(key, value) {
+  		if (typeof value === "function") {
+    		return "/Function(" + value.toString() + ")/";
+		}
+  		return value;
+	});
+	var obj2 = JSON.parse(json, function(key, value) {
+  		if (typeof value === "string" &&
+      		value.startsWith("/Function(") &&
+      		value.endsWith(")/")) {
+    		value = value.substring(10, value.length - 2);
+    		return (0, eval)("(" + value + ")");
+  		}
+  		return value;
+	});
+	return JSON.stringify(obj2)
+};
+`, result[1]))
+	if err != nil {
+		return fmt.Errorf("getting js result error: %w", err)
+	}
+	jsinit, ok := goja.AssertFunction(vm.Get("init"))
+	if !ok {
+		return fmt.Errorf("js init not found")
+	}
+
+	res, err := jsinit(goja.Undefined())
+	if err != nil {
+		return fmt.Errorf("getting js result error: %w", err)
+	}
+	log.WithField("data", res.Export().(string)).Debugln("extract room info")
+
+	l.res = gjson.Parse(res.Export().(string))
 	return nil
 }
 

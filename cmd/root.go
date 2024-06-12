@@ -110,7 +110,7 @@ func init() {
 	rootCmd.PersistentFlags().IntVarP(&listenPort, "listen-port", "p", 0, "listen port")
 	rootCmd.PersistentFlags().StringVar(&proxy, "proxy", "", "proxy url")
 	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", "", "logging file")
-	rootCmd.PersistentFlags().Uint32Var(&global.LogLevel, "log-level", 3, "log level (0 - 7, 3 = warn , 6 = debug)")
+	rootCmd.PersistentFlags().Uint32Var(&global.LogLevel, "log-level", 3, "log level (0 - 6, 3 = warn , 5 = debug)")
 
 	rootCmd.SetVersionTemplate(fmt.Sprintf(`{{with .Name}}{{printf "%%s version information: " .}}{{end}}
    {{printf "Version:    %%s" .Version}}
