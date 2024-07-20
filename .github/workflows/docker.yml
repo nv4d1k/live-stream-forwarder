@@ -1,5 +1,6 @@
-name: Release binary
+name: Build docker image and push into DockerHub
 on:
+  workflow_dispatch:
   release:
     types: [published]
 jobs:
