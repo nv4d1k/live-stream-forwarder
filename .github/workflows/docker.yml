@@ -1,0 +1,34 @@
+name: Release binary
+on:
+  release:
+    types: [published]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check repository
+        uses: actions/checkout@v4
+      - name: Set APP_VERSION env
+        run: echo APP_VERSION=$(echo ${GITHUB_REF} | rev | cut -d'/' -f 1 | rev ) >> ${GITHUB_ENV}
+      - name: Set BUILD_TIME env
+        run: echo BUILD_TIME=$(date +'%Y-%m-%d %H:%M:%S') >> ${GITHUB_ENV}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: login to docker registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{secrets.DOCKERHUB_USERNAME}}
+          password: ${{secrets.DOCKERHUB_TOKEN}}
+
+      - name: build and push docker image to registry
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args:
+            - VERSION=${{ env.APP_VERSION }}
+            - BUILD_TIME=${{ env.BUILD_TIME }}
+            - SHA=${{ github.sha }}
+          tags:
+            - nv4d1k/live-stream-forwarder:latest
+            - nv4d1k/live-stream-forwarder:${{ env.APP_VERSION }}

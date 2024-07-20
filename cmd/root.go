@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -106,8 +107,19 @@ func init() {
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
 	//rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
-	rootCmd.PersistentFlags().StringVarP(&listenAddress, "listen-address", "l", "127.0.0.1", "listen address")
-	rootCmd.PersistentFlags().IntVarP(&listenPort, "listen-port", "p", 0, "listen port")
+	rootCmd.PersistentFlags().StringVarP(&listenAddress, "listen-address", "l", func() string {
+		if len(os.Getenv("LISTEN_ADDR")) <= 0 {
+			return "127.0.0.1"
+		}
+		return net.ParseIP(os.Getenv("LISTEN_ADDR")).String()
+	}(), "listen address")
+	rootCmd.PersistentFlags().IntVarP(&listenPort, "listen-port", "p", func() int {
+		port, err := strconv.ParseInt(os.Getenv("LISTEN_PORT"), 10, 64)
+		if err == nil {
+			return int(port)
+		}
+		return 0
+	}(), "listen port")
 	rootCmd.PersistentFlags().StringVar(&proxy, "proxy", "", "proxy url")
 	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", "", "logging file")
 	rootCmd.PersistentFlags().Uint32Var(&global.LogLevel, "log-level", 3, "log level (0 - 6, 3 = warn , 5 = debug)")
