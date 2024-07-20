@@ -17,7 +17,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     -o /bin/lsf
 RUN go test -cover -v ./...
 
-FROM scratch
-COPY --from=builder /bin/lsf /
-RUN mkdir -p /tmp
-ENTRYPOINT ["/lsf"]
+FROM alpine:latest
+COPY --from=builder /bin/lsf /bin/lsf
+ENTRYPOINT ["/bin/lsf"]
