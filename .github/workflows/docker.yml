@@ -30,6 +30,6 @@ jobs:
             VERSION=${{ env.APP_VERSION }}
             BUILD_TIME=${{ env.BUILD_TIME }}
             SHA=${{ github.sha }}
-          tags:
-            - nv4d1k/live-stream-forwarder:latest
-            - nv4d1k/live-stream-forwarder:${{ env.APP_VERSION }}
+          tags: |
+            nv4d1k/live-stream-forwarder:latest
+            nv4d1k/live-stream-forwarder:${{ env.APP_VERSION }}
