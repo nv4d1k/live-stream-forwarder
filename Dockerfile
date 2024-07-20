@@ -19,4 +19,5 @@ RUN go test -cover -v ./...
 
 FROM scratch
 COPY --from=builder /bin/lsf /
+RUN mkdir -p /tmp
 ENTRYPOINT ["/lsf"]
