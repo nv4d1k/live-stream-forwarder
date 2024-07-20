@@ -3,8 +3,6 @@ ARG VERSION="0.0.0"
 ARG BUILD_TIME="Thu Jan 01 1970 00:00:00 GMT+0000"
 ARG SHA="e5fa44f2b31c1fb553b6021e7360d07d5d91ff5e"
 
-ENV GOPROXY="https://goproxy.cn,direct"
-
 COPY . /go/src/github.com/nv4d1k/live-stream-forwarder
 WORKDIR /go/src/github.com/nv4d1k/live-stream-forwarder
 
