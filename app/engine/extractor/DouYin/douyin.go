@@ -98,23 +98,35 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 		u string
 	)
 	log.WithField("field", "stream data").Debug(stream.Raw)
-	stream.Get("data").ForEach(func(key, value gjson.Result) bool {
-		sdkParams := gjson.Parse(value.Get("main.sdk_params").String())
-		if l.calcStreamWeight(sdkParams.Get("vbitrate").Int(), sdkParams.Get("resolution").String()) > n {
-			n = l.calcStreamWeight(sdkParams.Get("vbitrate").Int(), sdkParams.Get("resolution").String())
-			if format == "flv" {
-				u = value.Get("main.flv").String()
-				return true
-			}
-			if value.Get("main.hls").Exists() {
-				u = value.Get("main.hls").String()
-				return true
-			}
-			u = value.Get("main.flv").String()
+	switch {
+	case stream.Get("data.origin").Exists():
+		if format == "flv" {
+			u = stream.Get("data.origin.main.flv").String()
+			log.WithField("stream_url", u).Debugln("get origin flv url")
+			return url.Parse(u)
 		}
-		return true
-	})
-	return url.Parse(u)
+		u = stream.Get("data.origin.main.hls").String()
+		log.WithField("stream_url", u).Debugln("get origin hls url")
+		return url.Parse(u)
+	default:
+		stream.Get("data").ForEach(func(key, value gjson.Result) bool {
+			sdkParams := gjson.Parse(value.Get("main.sdk_params").String())
+			if l.calcStreamWeight(sdkParams.Get("vbitrate").Int(), sdkParams.Get("resolution").String()) > n {
+				n = l.calcStreamWeight(sdkParams.Get("vbitrate").Int(), sdkParams.Get("resolution").String())
+				if format == "flv" {
+					u = value.Get("main.flv").String()
+					return true
+				}
+				if value.Get("main.hls").Exists() {
+					u = value.Get("main.hls").String()
+					return true
+				}
+				u = value.Get("main.flv").String()
+			}
+			return true
+		})
+		return url.Parse(u)
+	}
 }
 
 func (l *Link) calcStreamWeight(vbitrate int64, resolution string) int64 {
