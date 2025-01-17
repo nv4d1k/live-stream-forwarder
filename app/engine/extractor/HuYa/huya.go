@@ -113,25 +113,6 @@ func (l *Link) getLive() (string, error) {
 		stream_info []string
 	)
 	l.res.Get("roomInfo.tLiveInfo.tLiveStreamInfo.vStreamInfo.value").ForEach(func(key, value gjson.Result) bool {
-		fmt.Println(value.Raw)
-		if value.Get("sFlvUrl").Exists() {
-			anticode, err := l.processAntiCode(value.Get("sFlvAntiCode").String(), value.Get("sStreamName").String())
-			if err != nil {
-				log.Println(fmt.Sprintf("processing anticode error: %s", err.Error()))
-				return false
-			}
-			u, err := url.Parse(fmt.Sprintf("%s/%s.%s?%s",
-				value.Get("sFlvUrl").String(),
-				value.Get("sStreamName").String(),
-				value.Get("sFlvUrlSuffix").String(),
-				anticode))
-			if err != nil {
-				log.Println(err.Error())
-				return false
-			}
-			u.Scheme = "https"
-			stream_info = append(stream_info, u.String())
-		}
 		if value.Get("sHlsUrl").Exists() {
 			anticode, err := l.processAntiCode(value.Get("sHlsAntiCode").String(), value.Get("sStreamName").String())
 			if err != nil {
@@ -142,6 +123,24 @@ func (l *Link) getLive() (string, error) {
 				value.Get("sHlsUrl").String(),
 				value.Get("sStreamName").String(),
 				value.Get("sHlsUrlSuffix").String(),
+				anticode))
+			if err != nil {
+				log.Println(err.Error())
+				return false
+			}
+			u.Scheme = "https"
+			stream_info = append(stream_info, u.String())
+		}
+		if len(stream_info) <= 0 && value.Get("sFlvUrl").Exists() {
+			anticode, err := l.processAntiCode(value.Get("sFlvAntiCode").String(), value.Get("sStreamName").String())
+			if err != nil {
+				log.Println(fmt.Sprintf("processing anticode error: %s", err.Error()))
+				return false
+			}
+			u, err := url.Parse(fmt.Sprintf("%s/%s.%s?%s",
+				value.Get("sFlvUrl").String(),
+				value.Get("sStreamName").String(),
+				value.Get("sFlvUrlSuffix").String(),
 				anticode))
 			if err != nil {
 				log.Println(err.Error())
