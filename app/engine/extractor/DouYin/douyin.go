@@ -1,18 +1,22 @@
 package DouYin
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
-	"github.com/nv4d1k/live-stream-forwarder/global"
-	"github.com/tidwall/gjson"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
+
+	"github.com/antchfx/htmlquery"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
+	"github.com/nv4d1k/live-stream-forwarder/global"
+	"github.com/tidwall/gjson"
 )
+
+var QIALITIES = []string{"origin", "hd", "sd", "ld", "md"}
 
 type Link struct {
 	rid string
@@ -40,7 +44,7 @@ func NewDouYinLink(rid string, proxy *url.URL) (douyin *Link, err error) {
 func (l *Link) getCookies() error {
 	log := global.Log.WithField("func", "app.engine.extractor.DouYin.getCookies")
 	reAcNonce := regexp.MustCompile(`(?i)__ac_nonce=([0-9a-f]*?);`)
-	reTtwid := regexp.MustCompile(`(?i)ttwid=(\S*);`)
+	//reTtwid := regexp.MustCompile(`(?i)ttwid=(\S*);`)
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/%s", l.rid), nil)
 	if err != nil {
@@ -58,10 +62,12 @@ func (l *Link) getCookies() error {
 	case reAcNonce.MatchString(resp.Header.Get("Set-Cookie")):
 		acNonce := reAcNonce.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
 		l.cookies = &http.Cookie{Name: "__ac_nonce", Value: acNonce}
-		return l.getCookies()
-	case reTtwid.MatchString(resp.Header.Get("Set-Cookie")):
-		ttwid := reTtwid.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
-		l.cookies = &http.Cookie{Name: "ttwid", Value: ttwid}
+		/*
+				return l.getCookies()
+			case reTtwid.MatchString(resp.Header.Get("Set-Cookie")):
+				ttwid := reTtwid.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
+				l.cookies = &http.Cookie{Name: "ttwid", Value: ttwid}
+		*/
 		return nil
 	default:
 		return errors.New("both __ac_nonce and ttwid are not found")
@@ -70,7 +76,8 @@ func (l *Link) getCookies() error {
 
 func (l *Link) GetLink(format string) (*url.URL, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.DouYin.GetLink")
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/webcast/room/web/enter/?aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&screen_width=1728&screen_height=1117&browser_language=zh-CN&browser_platform=Windows&browser_name=Chrome&browser_version=117.0.0.0&web_rid=%s", l.rid), nil)
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/%s", l.rid), nil)
 	if err != nil {
 		return nil, fmt.Errorf("making request for get link error: %w", err)
 	}
@@ -87,60 +94,57 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing response body error: %w", err)
 	}
-	log.WithField("field", "room json data").Debug(string(body))
-	data := gjson.GetBytes(body, "data.data.0")
-	if data.Get("status").Int() != 2 {
-		return nil, fmt.Errorf("room status error: status %d", data.Get("status").Int())
+	doc, err := htmlquery.Parse(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("parsing response body error: %w", err)
 	}
-	stream := gjson.Parse(data.Get("stream_url.live_core_sdk_data.pull_data.stream_data").String())
+	var liveData string
+	nodes := htmlquery.Find(doc, "//script")
+	for _, node := range nodes {
+		content, ok := l.extractJSON(htmlquery.InnerText(node))
+		if ok {
+			liveData = content
+			break
+		}
+	}
+	var stream gjson.Result
+	for _, quality := range QIALITIES {
+		if gjson.Get(liveData, fmt.Sprintf("data.%s", quality)).Exists() {
+			stream = gjson.Get(liveData, fmt.Sprintf("data.%s", quality))
+			break
+		}
+	}
 	var (
-		n int64 = -1
 		u string
 	)
 	log.WithField("field", "stream data").Debug(stream.Raw)
-	switch {
-	case stream.Get("data.origin").Exists():
-		if format == "flv" {
-			u = stream.Get("data.origin.main.flv").String()
-			log.WithField("stream_url", u).Debugln("get origin flv url")
-			return url.Parse(u)
-		}
-		u = stream.Get("data.origin.main.hls").String()
-		log.WithField("stream_url", u).Debugln("get origin hls url")
+	switch format {
+	case "flv":
+		u = stream.Get("main.flv").String()
+		log.WithField("stream_url", u).Debugln("get origin flv url")
 		return url.Parse(u)
 	default:
-		stream.Get("data").ForEach(func(key, value gjson.Result) bool {
-			sdkParams := gjson.Parse(value.Get("main.sdk_params").String())
-			if l.calcStreamWeight(sdkParams.Get("vbitrate").Int(), sdkParams.Get("resolution").String()) > n {
-				n = l.calcStreamWeight(sdkParams.Get("vbitrate").Int(), sdkParams.Get("resolution").String())
-				if format == "flv" {
-					u = value.Get("main.flv").String()
-					return true
-				}
-				if value.Get("main.hls").Exists() {
-					u = value.Get("main.hls").String()
-					return true
-				}
-				u = value.Get("main.flv").String()
-			}
-			return true
-		})
+		u = stream.Get("main.hls").String()
+		log.WithField("stream_url", u).Debugln("get origin hls url")
 		return url.Parse(u)
 	}
 }
 
-func (l *Link) calcStreamWeight(vbitrate int64, resolution string) int64 {
-	log := global.Log.WithField("function", "app.engine.extractor.DouYin.calcStreamWeight")
-	if !strings.Contains(resolution, "x") {
-		return -1
+func (l *Link) extractJSON(input string) (string, bool) {
+	re := regexp.MustCompile(`self\.__pace_f\.push\(\[1,"{(.*)}"\]\)`)
+	matches := re.FindStringSubmatch(input)
+	if len(matches) < 2 {
+		return "", false
 	}
-	w, err := strconv.ParseInt(strings.Split(resolution, "x")[0], 10, 64)
-	if err != nil {
-		log.Errorf("convert height to int64 error: %s", err.Error())
+
+	// matches[1] 是带转义的 JSON，比如 {\"key\":\"val\"}
+	escaped := matches[1]
+
+	// 用 json.Unmarshal 去掉转义
+	var result string
+	if err := json.Unmarshal([]byte(`"`+escaped+`"`), &result); err != nil {
+		return "", false
 	}
-	h, err := strconv.ParseInt(strings.Split(resolution, "x")[1], 10, 64)
-	if err != nil {
-		log.Errorf("convert weight to int64 error: %s", err.Error())
-	}
-	return w * h * vbitrate
+
+	return fmt.Sprintf("{%s}", result), true
 }
