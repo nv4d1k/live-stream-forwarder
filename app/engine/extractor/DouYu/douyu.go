@@ -61,7 +61,7 @@ func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 	}
 	_, err = dy.getPreData()
 	if err != nil {
-		return nil, fmt.Errorf("get pre data error：%w", err)
+		return nil, fmt.Errorf("get pre data error: %w", err)
 	}
 	return dy, nil
 }

@@ -61,6 +61,7 @@ func (l *Link) getCookies() error {
 	switch {
 	case reAcNonce.MatchString(resp.Header.Get("Set-Cookie")):
 		acNonce := reAcNonce.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
+		log.WithField("__ac_nonce", acNonce).Debugln("__ac_nonce found")
 		l.cookies = &http.Cookie{Name: "__ac_nonce", Value: acNonce}
 		/*
 				return l.getCookies()
@@ -85,6 +86,7 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Host", "live.douyin.com")
 	req.Header.Set("Connection", "keep-alive")
+	log.WithField("field", "sending requests with cookies").Debugf("%v\n", req)
 	resp, err := l.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request for get link error: %w", err)
@@ -94,6 +96,7 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing response body error: %w", err)
 	}
+	log.WithField("headers", resp.Header).Debugln("response header of request with cookies")
 	doc, err := htmlquery.Parse(strings.NewReader(string(body)))
 	if err != nil {
 		return nil, fmt.Errorf("parsing response body error: %w", err)
@@ -101,6 +104,7 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 	var liveData string
 	nodes := htmlquery.Find(doc, "//script")
 	for _, node := range nodes {
+		log.WithField("field", "script node").Debugln(htmlquery.InnerText(node))
 		content, ok := l.extractJSON(htmlquery.InnerText(node))
 		if ok {
 			liveData = content
@@ -117,7 +121,7 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 	var (
 		u string
 	)
-	log.WithField("field", "stream data").Debug(stream.Raw)
+	log.WithField("field", "stream data").Debugln(stream.Raw)
 	switch format {
 	case "flv":
 		u = stream.Get("main.flv").String()
@@ -131,20 +135,32 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 }
 
 func (l *Link) extractJSON(input string) (string, bool) {
-	re := regexp.MustCompile(`self\.__pace_f\.push\(\[1,"{(.*)}"\]\)`)
+	re := regexp.MustCompile(`self\.__pace_f\.push\(\[1,"(.*)"\]\)`)
 	matches := re.FindStringSubmatch(input)
 	if len(matches) < 2 {
 		return "", false
 	}
 
-	// matches[1] 是带转义的 JSON，比如 {\"key\":\"val\"}
+	// Original escaped JSON
 	escaped := matches[1]
 
-	// 用 json.Unmarshal 去掉转义
-	var result string
-	if err := json.Unmarshal([]byte(`"`+escaped+`"`), &result); err != nil {
+	// Unescape to clean JSON
+	var raw string
+	if err := json.Unmarshal([]byte(`"`+escaped+`"`), &raw); err != nil {
 		return "", false
 	}
 
-	return fmt.Sprintf("{%s}", result), true
+	// Verify it's valid JSON and check if the "common" field exists
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return "", false
+	}
+
+	// Go maps are unordered, so we can't directly check for the "first element".
+	// Therefore, we check if the "common" field must exist instead.
+	if _, ok := parsed["common"]; !ok {
+		return "", false
+	}
+
+	return raw, true
 }
