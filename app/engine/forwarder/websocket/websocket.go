@@ -2,10 +2,11 @@ package websocket
 
 import (
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/nv4d1k/live-stream-forwarder/global"
 	"net/http"
 	"net/url"
+
+	"github.com/gin-gonic/gin"
+	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
 type WebSocketForwarder struct {
