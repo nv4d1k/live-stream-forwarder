@@ -44,7 +44,7 @@ func NewDouYinLink(rid string, proxy *url.URL) (douyin *Link, err error) {
 func (l *Link) getCookies() error {
 	log := global.Log.WithField("func", "app.engine.extractor.DouYin.getCookies")
 	reAcNonce := regexp.MustCompile(`(?i)__ac_nonce=([0-9a-f]*?);`)
-	//reTtwid := regexp.MustCompile(`(?i)ttwid=(\S*);`)
+	reTtwid := regexp.MustCompile(`(?i)ttwid=(\S*);`)
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/%s", l.rid), nil)
 	if err != nil {
@@ -69,10 +69,14 @@ func (l *Link) getCookies() error {
 				ttwid := reTtwid.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
 				l.cookies = &http.Cookie{Name: "ttwid", Value: ttwid}
 		*/
-		return nil
+	case reTtwid.MatchString(resp.Header.Get("Set-Cookie")):
+		ttwid := reTtwid.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
+		log.WithField("ttwid", ttwid).Debugln("ttwid found")
+		l.cookies = &http.Cookie{Name: "ttwid", Value: ttwid}
 	default:
 		return errors.New("both __ac_nonce and ttwid are not found")
 	}
+	return nil
 }
 
 func (l *Link) GetLink(format string) (*url.URL, error) {

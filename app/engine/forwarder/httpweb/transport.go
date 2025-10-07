@@ -1,8 +1,9 @@
 package httpweb
 
 import (
-	"github.com/nv4d1k/live-stream-forwarder/global"
 	"net/http"
+
+	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
 type AddHeaderTransport struct {

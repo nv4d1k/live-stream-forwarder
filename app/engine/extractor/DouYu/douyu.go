@@ -5,8 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
-	"github.com/nv4d1k/live-stream-forwarder/global"
 	"io"
 	"math"
 	"math/rand"
@@ -17,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
+	"github.com/nv4d1k/live-stream-forwarder/global"
 
 	"golang.org/x/net/html"
 
@@ -78,7 +79,7 @@ func (l *Link) GetLink() (*url.URL, error) {
 	s := rand.New(rand.NewSource(time.Now().Unix()))
 	playID := l.t13 + "-" + strconv.Itoa(int(math.Floor(s.Float64()*999999998))) + "1"
 	switch data.Get("data.p2p").Int() {
-	case 0:
+	case 0, 9:
 		return url.Parse(fmt.Sprintf("%s/%s", data.Get("data.rtmp_url").String(), data.Get("data.rtmp_live").String()))
 	case 2:
 		txTime := fmt.Sprintf("%x", int64(math.Round((float64(time.Now().UnixMilli())+600000)/1000)))
@@ -101,7 +102,7 @@ func (l *Link) GetLink() (*url.URL, error) {
 		}
 		u.Host = "hlsh5p2.douyucdn2.cn"
 		return url.Parse(strings.ReplaceAll(u.String(), ".flv", ".xs"))
-	case 9, 10:
+	case 10:
 		u := fmt.Sprintf("wss://%s/%s/live/%s&delay=%s&playid=%s&uuid=%s&txSecret=%s&txTime=%s",
 			func() string {
 				if data.Get("data.p2pMeta.dyxp2p_sug_egde").Exists() {
