@@ -58,17 +58,17 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "*")
-	//w.WriteHeader(200)
-	//w.Flush()
+	w.WriteHeader(200)
+	w.Flush()
 
-	conn, buffer, err := w.(http.Hijacker).Hijack()
+	conn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		if conn != nil {
 			conn.Close()
 		}
 		return err
 	}
-	buffer.WriteString("HTTP/1.1 200 OK\r\n")
+	/*buffer.WriteString("HTTP/1.1 200 OK\r\n")
 	buffer.WriteString("Content-Type: video/x-flv\r\n")
 	buffer.WriteString("Transfer-Encoding: identity\r\n")
 	buffer.WriteString("Connection: close\r\n")
@@ -78,7 +78,7 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	buffer.WriteString("Access-Control-Allow-Methods: *\r\n")
 	buffer.WriteString("\r\n")
 
-	buffer.Flush()
+	buffer.Flush()*/
 
 	go func() {
 		defer st.Close()
