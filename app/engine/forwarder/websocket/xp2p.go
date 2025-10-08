@@ -112,7 +112,6 @@ func (c *client) ReadLoop() {
 			c.pipe.CloseWithError(err)
 			return
 		}
-
 		switch mt {
 		case ws.BinaryMessage:
 			c.pipe.Write(body)

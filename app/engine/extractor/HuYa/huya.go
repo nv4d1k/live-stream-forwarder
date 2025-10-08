@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/dop251/goja"
-	"github.com/nv4d1k/live-stream-forwarder/global"
 	"io"
 	"math/rand"
 	"net/http"
@@ -16,6 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dop251/goja"
+	"github.com/nv4d1k/live-stream-forwarder/global"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/tidwall/gjson"
@@ -246,7 +247,7 @@ func (l *Link) processAntiCode(anticode string, streamname string) (params strin
 		return "", fmt.Errorf("parsing anticode error: %w", err)
 	}
 	q.Set("ver", "1")
-	q.Set("sv", "2110211124")
+	q.Set("sv", "202412311405")
 	q.Set("seqid", strconv.FormatInt(l.uidi+time.Now().UnixMilli(), 10))
 	q.Set("uid", l.uid)
 	q.Set("uuid", l.uuid)
