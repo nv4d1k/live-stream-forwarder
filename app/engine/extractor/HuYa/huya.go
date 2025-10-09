@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -54,10 +55,10 @@ func NewHuyaLink(rid string, proxy *url.URL) (*Link, error) {
 	return hy, nil
 }
 
-func (l *Link) GetLink() (*url.URL, error) {
+func (l *Link) GetLink(format string) (*url.URL, error) {
 	switch l.res.Get("roomInfo.eLiveStatus").Int() {
 	case 2:
-		liveInfo, err := l.getLive()
+		liveInfo, err := l.getLive(format)
 		if err != nil {
 			return nil, fmt.Errorf("get live info error: %w", err)
 		}
@@ -108,10 +109,12 @@ func (l *Link) getAnonymousUID() (err error) {
 	return nil
 }
 
-func (l *Link) getLive() (string, error) {
+func (l *Link) getLive(format string) (string, error) {
 	log := global.Log.WithField("function", "app.engine.extractor.HuYa.getLive")
 	var (
-		stream_info []string
+		stream_info     []string
+		flv_stream_info []string
+		hls_stream_info []string
 	)
 	l.res.Get("roomInfo.tLiveInfo.tLiveStreamInfo.vStreamInfo.value").ForEach(func(key, value gjson.Result) bool {
 		if value.Get("sHlsUrl").Exists() {
@@ -130,7 +133,7 @@ func (l *Link) getLive() (string, error) {
 				return false
 			}
 			u.Scheme = "https"
-			stream_info = append(stream_info, u.String())
+			hls_stream_info = append(hls_stream_info, u.String())
 		}
 		if len(stream_info) <= 0 && value.Get("sFlvUrl").Exists() {
 			anticode, err := l.processAntiCode(value.Get("sFlvAntiCode").String(), value.Get("sStreamName").String())
@@ -148,16 +151,30 @@ func (l *Link) getLive() (string, error) {
 				return false
 			}
 			u.Scheme = "https"
-			stream_info = append(stream_info, u.String())
+			flv_stream_info = append(flv_stream_info, u.String())
 		}
 		return true
 	})
+	stream_info = slices.Concat(flv_stream_info, hls_stream_info)
 	if len(stream_info) <= 0 {
 		return "", errors.New("no validate link found")
 	}
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 
-	return stream_info[r.Intn(len(stream_info)-1)], nil
+	switch format {
+	case "flv":
+		if len(flv_stream_info) <= 0 {
+			return "", errors.New("no validate flv link found")
+		}
+		return flv_stream_info[r.Intn(len(flv_stream_info)-1)], nil
+	case "hls":
+		if len(hls_stream_info) <= 0 {
+			return "", errors.New("no validate hls link found")
+		}
+		return hls_stream_info[r.Intn(len(hls_stream_info)-1)], nil
+	default:
+		return stream_info[r.Intn(len(stream_info)-1)], nil
+	}
 }
 
 func (l *Link) getRoomInfo() (err error) {

@@ -2,6 +2,11 @@ package controllers
 
 import (
 	"fmt"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/BiliBili"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/DouYin"
@@ -12,16 +17,13 @@ import (
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/websocket"
 	"github.com/nv4d1k/live-stream-forwarder/global"
-	"net/http"
-	"net/url"
-	"path"
-	"strings"
 )
 
 func Forwarder(c *gin.Context) {
 	log := global.Log.WithField("function", "app.http.controllers.Forwarder")
 	log.WithField("http request", "headers").Debug(c.Request.Header)
 	proxy := c.GetString("proxy")
+	format := c.DefaultQuery("format", "")
 	var proxyURL *url.URL
 	var err error
 	if proxy != "" {
@@ -95,7 +97,7 @@ func Forwarder(c *gin.Context) {
 				c.String(500, err.Error())
 				return
 			}
-			u, err := link.GetLink()
+			u, err := link.GetLink(format)
 			if err != nil {
 				log.Errorf("get link error: %s\n", err.Error())
 				c.String(500, err.Error())
@@ -251,7 +253,7 @@ func Forwarder(c *gin.Context) {
 				c.String(500, err.Error())
 				return
 			}
-			u, err := link.GetLink(c.DefaultQuery("format", "hls"))
+			u, err := link.GetLink(format)
 			if err != nil {
 				log.Errorf("get link error: %s\n", err.Error())
 				c.String(500, err.Error())
