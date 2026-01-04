@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -48,10 +49,11 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	}
 	err = st.Start()
 	if err != nil {
+		log.Errorln("start backend error:", err.Error())
 		return err
 	}
 	w := c.Writer
-	w.Header().Set("Content-Type", "video/x-flv")
+	/*w.Header().Set("Content-Type", "video/x-flv")
 	w.Header().Set("Transfer-Encoding", "identity")
 	w.Header().Set("Connection", "close")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -59,16 +61,18 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "*")
 	w.WriteHeader(200)
-	w.Flush()
+	w.Flush()*/
 
 	conn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
+		log.Errorln(err.Error())
 		if conn != nil {
 			conn.Close()
 		}
 		return err
 	}
-	/*buffer.WriteString("HTTP/1.1 200 OK\r\n")
+	buffer := bytes.NewBuffer(nil)
+	buffer.WriteString("HTTP/1.1 200 OK\r\n")
 	buffer.WriteString("Content-Type: video/x-flv\r\n")
 	buffer.WriteString("Transfer-Encoding: identity\r\n")
 	buffer.WriteString("Connection: close\r\n")
@@ -78,7 +82,11 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	buffer.WriteString("Access-Control-Allow-Methods: *\r\n")
 	buffer.WriteString("\r\n")
 
-	buffer.Flush()*/
+	_, err = conn.Write(buffer.Bytes())
+	if err != nil {
+		log.WithError(err).Errorln("write frontend error")
+		return err
+	}
 
 	go func() {
 		defer st.Close()

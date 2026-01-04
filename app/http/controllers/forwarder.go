@@ -70,7 +70,7 @@ func Forwarder(c *gin.Context) {
 			err = f.Start(c, u.String())
 			if err != nil {
 				log.Errorf("forward ws(s) stream error: %s\n", err.Error())
-				c.String(500, err.Error())
+				//c.String(500, err.Error())
 				return
 			}
 		default:
@@ -128,7 +128,11 @@ func Forwarder(c *gin.Context) {
 			p := hls.NewHLSForwarder(proxyURL, true)
 			err := p.Forward(c, pp, prefix)
 			if err != nil {
-				log.Errorf("forward hls stream error: %s\n", err.Error())
+				if strings.Contains(err.Error(), "403") {
+					c.Redirect(302, fmt.Sprintf("/huya/%s?format=hls", c.Param("room")))
+					return
+				}
+				log.WithField("url", pp).Errorf("forward hls stream error: %s\n", err.Error())
 				c.String(400, err.Error())
 				return
 			}

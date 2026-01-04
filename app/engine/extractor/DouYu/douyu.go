@@ -3,6 +3,7 @@ package DouYu
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,23 +20,30 @@ import (
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 
-	"golang.org/x/net/html"
-
-	"github.com/dop251/goja"
-	"github.com/google/uuid"
+	"github.com/iceking2nd/go-toolkits/converter"
+	uuidgen "github.com/satori/go.uuid"
 	"github.com/tidwall/gjson"
 )
 
 type Link struct {
-	rid        string
-	did        string
-	t10        string
-	t13        string
-	apiErrCode int64
-	res        string
-	proxy      *url.URL
+	rid          string
+	did          string
+	encData      string
+	t10          string
+	t13          string
+	apiErrCode   int64
+	res          string
+	streamParams streamParameters
+	proxy        *url.URL
 
 	client *http.Client
+}
+
+type streamParameters struct {
+	RoomID    uint64 `json:"roomID"`
+	Nonce     string `json:"nonce"`
+	OwnerUID  uint64 `json:"owner_uid"`
+	CookiePre string `json:"cookiePre"`
 }
 
 func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
@@ -52,17 +60,18 @@ func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 	} else {
 		dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
 	}
-	dy.rid, err = dy.getRealRoomID(rid)
+	dy.streamParams, err = dy.getLegacyFirstStreamParameters(rid)
 	if err != nil {
 		return nil, fmt.Errorf("get real room id error: %w", err)
 	}
+	dy.rid = fmt.Sprintf("%d", dy.streamParams.RoomID)
 	dy.did, err = dy.getDeviceID()
 	if err != nil {
 		return nil, fmt.Errorf("get device id error: %w", err)
 	}
-	_, err = dy.getPreData()
+	dy.encData, err = dy.getEncryptData()
 	if err != nil {
-		return nil, fmt.Errorf("get pre data error: %w", err)
+		return nil, fmt.Errorf("get encrypt data error: %w", err)
 	}
 	return dy, nil
 }
@@ -70,12 +79,12 @@ func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 func (l *Link) GetLink() (*url.URL, error) {
 	log := global.Log.WithField("function", "app.engine.extractor.DouYu.GetLink")
 	data, err := l.getRateStream()
-	log.WithField("field", "rate stream data").Debug(data.Raw)
+	log.WithField("data", data.Raw).Debugln("rate stream data")
 	if err != nil {
 		return nil, fmt.Errorf("get rate stream error: %w", err)
 	}
 	streamID := strings.Split(filepath.Base(data.Get("data.rtmp_live").String()), ".")[0]
-	uuid, _ := uuid.NewUUID()
+	uuid := uuidgen.NewV4()
 	s := rand.New(rand.NewSource(time.Now().Unix()))
 	playID := l.t13 + "-" + strconv.Itoa(int(math.Floor(s.Float64()*999999998))) + "1"
 	switch data.Get("data.p2p").Int() {
@@ -182,82 +191,72 @@ func (l *Link) getDeviceID() (did string, err error) {
 	return didData.Get("data.did").String(), nil
 }
 
+func (l *Link) getEncryptData() (encData string, err error) {
+	log := global.Log.WithField("function", "app.engine.extractor.DouYu.getEncryptData")
+	if len(l.did) <= 0 {
+		return "", errors.New("did is empty")
+	}
+	resp, err := l.client.Get(fmt.Sprintf("https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did=%s", l.did))
+	if err != nil {
+		return "", fmt.Errorf("sending request error for get encrypt data: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("parsing body error for get encrypt data: %w", err)
+	}
+	encData = gjson.GetBytes(body, "data").String()
+	log.WithField("encrypt data", encData).Debugln("get encrypt data")
+	return encData, nil
+}
+
+func (l *Link) calculateAuth() (auth string, err error) {
+	log := global.Log.WithField("function", "app.engine.extractor.DouYu.calculateAuth")
+	encData := gjson.Parse(l.encData)
+	key := encData.Get("key").String()
+	randStr := encData.Get("rand_str").String()
+	encTime := encData.Get("enc_time").Int()
+	authString := randStr
+	for i := int64(0); i < encTime; i++ {
+		log.WithField("encrypt_time", i).WithField("auth_string", authString).WithField("key", key).Debugln("calculate auth in loop")
+		hash := md5.Sum([]byte(fmt.Sprintf("%s%s", authString, key)))
+		authString = hex.EncodeToString(hash[:])
+	}
+	log.WithField("authString", authString).WithField("key", key).WithField("room_id", l.rid).WithField("timestamp", l.t10).Debugln("calculate auth after loop")
+	hash := md5.Sum([]byte(fmt.Sprintf("%s%s%s", authString, key, fmt.Sprintf("%s%s", l.rid, l.t10))))
+	auth = hex.EncodeToString(hash[:])
+	log.WithField("auth", auth).Debugln("calculate authString")
+	return auth, nil
+}
+
 func (l *Link) getRateStream() (gjson.Result, error) {
 	log := global.Log.WithField("function", "app.engine.extractor.DouYu.getRateStream")
-	z := html.NewTokenizer(strings.NewReader(l.res))
-	var scripts []string
-	var stag bool
-FIND:
-	for {
-		t := z.Next()
-		switch t {
-		case html.ErrorToken:
-			break FIND
-		case html.StartTagToken:
-			x := z.Token()
-			stag = x.Data == "script"
-		case html.TextToken:
-			x := z.Token()
-			if stag {
-				scripts = append(scripts, x.Data)
-			}
-			stag = false
-		}
-	}
-	var jj string
-	for _, c := range scripts {
-		if strings.Contains(c, "ub98484234") {
-			jj = c
-		}
-	}
-	if jj == "" {
-		return gjson.Result{}, fmt.Errorf("could not find ub98484234 function")
-	}
-
-	// Step 2: Modify the JavaScript function to remove eval statement
-	replaceRe := regexp.MustCompile(`return\s*eval\(strc\)\([0-9a-z]+,[0-9a-z]+,[0-9a-z]+\);}`)
-	jsFunc := replaceRe.ReplaceAllString(jj, "return strc;}")
-
-	// Step 3: Compile and execute the modified JavaScript function
-	js := fmt.Sprintf("%s\nub98484234()", jsFunc)
-
-	vm := goja.New()
-	vmResult, err := vm.RunString(js)
+	auth, err := l.calculateAuth()
 	if err != nil {
-		return gjson.Result{}, fmt.Errorf("running ub98484234 error: %w", err)
+		return gjson.Result{}, fmt.Errorf("calculate auth error for get rate stream: %w", err)
 	}
-	result := vmResult.String()
-	log.WithField("field", "result of running ub98484234").Debug(result)
-	re := regexp.MustCompile(`v=(\d+)`)
-	match := re.FindStringSubmatch(result)
-	if len(match) < 2 {
-		return gjson.Result{}, fmt.Errorf("could not find v parameter")
-	}
-	v := match[1]
-	// Step 5: Generate rb parameter using md5 function
-	rbByte := md5.Sum([]byte(fmt.Sprintf("%s%s%s%s", l.rid, l.did, l.t10, v)))
-	rb := hex.EncodeToString(rbByte[:])
-
-	// Step 6: Modify JavaScript function to replace return statement with rb parameter
-	jsFunc = strings.Replace(result, "return rt;})", "return rt;}", -1)
-	jsFunc = strings.Replace(jsFunc, "(function (", "function sign(", -1)
-	jsFunc = strings.Replace(jsFunc, "CryptoJS.MD5(cb).toString()", fmt.Sprintf("\"%s\"", rb), -1)
-	jsFunc = fmt.Sprintf("%s sign(%s, \"%s\", %s);", jsFunc, l.rid, l.did, l.t10)
-
-	vmSignResult, err := vm.RunString(jsFunc)
-	if err != nil {
-		return gjson.Result{}, fmt.Errorf("running signature function error: %w", err)
-	}
-	result = vmSignResult.String()
-	params := fmt.Sprintf("%s&ver=Douyu_223092005&rate=0&cdn=&iar=0&ive=0&hevc=0&fa=0", result)
-	url := fmt.Sprintf("https://playweb.douyu.com/lapi/live/getH5Play/%s", l.rid)
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(params))
+	params := url.Values{}
+	params.Set("auth", auth)
+	params.Set("enc_data", gjson.Get(l.encData, "enc_data").String())
+	params.Set("tt", l.t10)
+	params.Set("did", l.did)
+	params.Set("rate", "0")
+	params.Set("cdn", "")
+	params.Set("ive", "0")
+	params.Set("hevc", "1")
+	params.Set("fa", "0")
+	log.WithField("params", params.Encode()).Debugln("get rate stream")
+	rateStreamUrl := fmt.Sprintf("https://www.douyu.com/lapi/live/getH5PlayV1/%s", l.rid)
+	req, err := http.NewRequest(http.MethodPost, rateStreamUrl, strings.NewReader(params.Encode()))
 	if err != nil {
 		return gjson.Result{}, fmt.Errorf("making RateStream POST request error: %w", err)
 	}
-	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", fmt.Sprintf("https://www.douyu.com/%s", l.rid))
+	req.Header.Set("Origin", "https://www.douyu.com")
+	log.WithField("headers", req.Header).Debugln("get rate stream")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := l.client.Do(req)
 	if err != nil {
 		return gjson.Result{}, fmt.Errorf("sending RateStream POST request error: %w", err)
 	}
@@ -273,60 +272,26 @@ FIND:
 	return gjson.ParseBytes(body), nil
 }
 
-func (l *Link) getRealRoomID(rfid string) (rid string, err error) {
-	ridRegex := regexp.MustCompile(`ROOM\.room_id\s?=\s?(\d{1,8});`)
+func (l *Link) getLegacyFirstStreamParameters(rfid string) (sp streamParameters, err error) {
+	streamParamRegex := regexp.MustCompile(`window.preloadStreamUrlPromise = getLegacyFirstStream\((.*)\)\s?;`)
 	resp, err := l.client.Get(fmt.Sprintf("https://www.douyu.com/%s", rfid))
 	if err != nil {
-		return "", fmt.Errorf("send request error when getting real room id: %w", err)
+		return sp, fmt.Errorf("send request error when getting real room id: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("parsing response body error when getting real room id: %w", err)
+		return sp, fmt.Errorf("parsing response body error when getting real room id: %w", err)
 	}
 	l.res = string(body)
-	rids := ridRegex.FindStringSubmatch(l.res)
-	if len(rids) != 2 {
-		return "", errors.New("invalidate room id")
+	streamParam := streamParamRegex.FindStringSubmatch(l.res)
+	if len(streamParam) != 2 {
+		return sp, errors.New("invalidate stream parameters")
 	}
-	return rids[1], nil
-}
-
-func (l *Link) getPreData() (errorCode int64, err error) {
-	log := global.Log.WithField("function", "app.engine.extractor.DouYu.getPreData")
-	var (
-		req  *http.Request
-		resp *http.Response
-		body []byte
-	)
-	data := url.Values{}
-	data.Add("rid", l.rid)
-	data.Add("did", l.did)
-	hash := md5.Sum([]byte(fmt.Sprintf("%s%s", l.rid, l.t13)))
-	auth := hex.EncodeToString(hash[:])
-	req, err = http.NewRequest("POST", fmt.Sprintf("https://playweb.douyucdn.cn/lapi/live/hlsH5Preview/%s", l.rid), strings.NewReader(data.Encode()))
+	spjson, err := converter.JSObj2JSON(streamParam[1])
 	if err != nil {
-		return 0, fmt.Errorf("making request error: %w", err)
+		return sp, fmt.Errorf("parsing stream parameters error: %w", err)
 	}
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Add("rid", l.rid)
-	req.Header.Add("time", l.t13)
-	req.Header.Add("auth", auth)
-	resp, err = l.client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("post for predata error: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, fmt.Errorf("parse body error for get predata: %w", err)
-	}
-	log.WithField("field", "predata body").Debug(string(body))
-	l.apiErrCode = gjson.GetBytes(body, "error").Int()
-	switch gjson.GetBytes(body, "error").Int() {
-	case 0, 742017:
-		return gjson.GetBytes(body, "error").Int(), nil
-	default:
-		return gjson.GetBytes(body, "error").Int(), fmt.Errorf("%s(%d)", gjson.GetBytes(body, "msg").String(), gjson.GetBytes(body, "error").Int())
-	}
+	err = json.Unmarshal(spjson, &sp)
+	return sp, nil
 }
