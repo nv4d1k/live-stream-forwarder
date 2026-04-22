@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	libm3u8 "github.com/grafov/m3u8"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"io"
 	"net/http"
@@ -14,14 +15,16 @@ import (
 )
 
 type HLSForwarder struct {
-	proxy *url.URL
-	hc    *http.Client
+	proxy  *url.URL
+	hc     *http.Client
+	mobile bool
 }
 
 func NewHLSForwarder(proxy *url.URL, mobile bool) *HLSForwarder {
 	h := &HLSForwarder{
-		proxy: proxy,
-		hc:    &http.Client{},
+		proxy:  proxy,
+		hc:     &http.Client{},
+		mobile: mobile,
 	}
 	if proxy != nil {
 		h.hc.Transport = httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, mobile)
@@ -29,6 +32,28 @@ func NewHLSForwarder(proxy *url.URL, mobile bool) *HLSForwarder {
 		h.hc.Transport = httpweb.NewAddHeaderTransport(nil, mobile)
 	}
 	return h
+}
+
+// StreamSegment returns a *stream.Stream for non-m3u8 segment data.
+// When a 403 is encountered, extractFn is called to re-obtain the playlist URL
+// and the segment URL is re-fetched.
+func (m *HLSForwarder) StreamSegment(extractFn stream.ExtractFunc) *stream.Stream {
+	return stream.NewStream(extractFn, m.fetchSegment)
+}
+
+// fetchSegment fetches a segment URL and returns its body.
+func (m *HLSForwarder) fetchSegment(u string, _ http.Header) (io.ReadCloser, error) {
+	log := global.Log.WithField("function", "app.engine.forwarder.hls.fetchSegment")
+	log.WithField("field", "backend url").Debug(u)
+	resp, err := m.hc.Get(u)
+	if err != nil {
+		return nil, fmt.Errorf("get backend file error: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("err got: %s", resp.Status)
+	}
+	return resp.Body, nil
 }
 
 func (m *HLSForwarder) WrapPlaylist(ctx *gin.Context, origin, prefix string) error {
@@ -149,6 +174,7 @@ func (m *HLSForwarder) GetM3u8(url string) (libm3u8.Playlist, libm3u8.ListType, 
 		return nil, 0, fmt.Errorf("get m3u8 file error: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, 0, fmt.Errorf("err got: %s", resp.Status)
 	}
 
@@ -182,6 +208,7 @@ func (m *HLSForwarder) Forward(ctx *gin.Context, uu, prefix string) error {
 			return fmt.Errorf("get backend file error: %w", err)
 		}
 		if resp.StatusCode != 200 {
+			resp.Body.Close()
 			return fmt.Errorf("err got: %s", resp.Status)
 		}
 		defer resp.Body.Close()

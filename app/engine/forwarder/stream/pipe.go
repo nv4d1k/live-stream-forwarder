@@ -1,4 +1,4 @@
-package websocket
+package stream
 
 import (
 	"bytes"
@@ -70,7 +70,7 @@ func (p *Pipe) Read(d []byte) (n int, err error) {
 		}
 		if p.err != nil {
 			if p.readFn != nil {
-				p.readFn()     // e.g. copy trailers
+				p.readFn()
 				p.readFn = nil // not sticky like p.err
 			}
 			p.b = nil
