@@ -3,11 +3,13 @@ package httpweb
 import (
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/nv4d1k/live-stream-forwarder/global"
 	"io"
 	"net/http"
 	"net/url"
+
+	"github.com/gin-gonic/gin"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
+	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
 type HTTPWebForwarder struct {
@@ -19,6 +21,47 @@ func NewHTTPWebForwarder(proxy *url.URL, mobile bool) *HTTPWebForwarder {
 	h.Client = &http.Client{}
 	h.Client.Transport = NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, mobile)
 	return h
+}
+
+// Stream returns a *stream.Stream that continuously fetches and pipes data from
+// the upstream. When a 403 is encountered, extractFn is called to get a fresh URL.
+func (h *HTTPWebForwarder) Stream(extractFn stream.ExtractFunc) *stream.Stream {
+	return stream.NewStream(extractFn, h.fetch)
+}
+
+// fetch makes a GET request and returns the response body.
+func (h *HTTPWebForwarder) fetch(u string, headers http.Header) (io.ReadCloser, error) {
+	log := global.Log.WithField("function", "app.engine.forwarder.httpweb.fetch")
+	log.WithField("field", "backend url").Debug(u)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("making backend request error: %w", err)
+	}
+	for hk := range headers {
+		req.Header.Set(hk, headers.Get(hk))
+	}
+	resp, err := h.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sending backend request error: %w", err)
+	}
+	switch resp.StatusCode {
+	case 200:
+		return resp.Body, nil
+	case 301, 302:
+		loc := resp.Header.Get("Location")
+		resp.Body.Close()
+		if loc == "" {
+			return nil, errors.New("err no redirect location")
+		}
+		_, err = url.Parse(loc)
+		if err != nil {
+			return nil, fmt.Errorf("err url in location")
+		}
+		return h.fetch(loc, headers)
+	default:
+		resp.Body.Close()
+		return nil, fmt.Errorf("err got: %s", resp.Status)
+	}
 }
 
 func (h *HTTPWebForwarder) Forward(ctx *gin.Context, headers http.Header, u string, depth int) error {

@@ -117,7 +117,7 @@ func (l *Link) getLive(format string) (string, error) {
 		hls_stream_info []string
 	)
 	l.res.Get("roomInfo.tLiveInfo.tLiveStreamInfo.vStreamInfo.value").ForEach(func(key, value gjson.Result) bool {
-		if value.Get("sHlsUrl").Exists() {
+		/*if value.Get("sHlsUrl").Exists() {
 			anticode, err := l.processAntiCode(value.Get("sHlsAntiCode").String(), value.Get("sStreamName").String())
 			if err != nil {
 				log.Println(fmt.Sprintf("processing anticode error: %s", err.Error()))
@@ -134,7 +134,7 @@ func (l *Link) getLive(format string) (string, error) {
 			}
 			u.Scheme = "https"
 			hls_stream_info = append(hls_stream_info, u.String())
-		}
+		}*/
 		if len(stream_info) <= 0 && value.Get("sFlvUrl").Exists() {
 			anticode, err := l.processAntiCode(value.Get("sFlvAntiCode").String(), value.Get("sStreamName").String())
 			if err != nil {

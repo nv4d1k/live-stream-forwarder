@@ -5,8 +5,6 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/nv4d1k/live-stream-forwarder/app/http/controllers"
-	"github.com/nv4d1k/live-stream-forwarder/global"
 	"io"
 	"log"
 	"net"
@@ -15,6 +13,9 @@ import (
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/nv4d1k/live-stream-forwarder/app/http/controllers"
+	"github.com/nv4d1k/live-stream-forwarder/global"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"

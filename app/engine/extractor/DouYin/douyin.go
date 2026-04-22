@@ -126,6 +126,7 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 		u string
 	)
 	log.WithField("field", "stream data").Debugln(stream.Raw)
+	format = "flv"
 	switch format {
 	case "flv":
 		u = stream.Get("main.flv").String()

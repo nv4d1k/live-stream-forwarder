@@ -3,15 +3,16 @@ package BiliBili
 import (
 	"errors"
 	"fmt"
-	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
-	"github.com/nv4d1k/live-stream-forwarder/global"
-	"github.com/tidwall/gjson"
 	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
+	"github.com/nv4d1k/live-stream-forwarder/global"
+	"github.com/tidwall/gjson"
 )
 
 type Link struct {
@@ -85,7 +86,7 @@ func (l *Link) getLinkByAPIv2() (*url.URL, error) {
 	}
 	uq := u.Query()
 	uq.Set("room_id", l.rid)
-	uq.Set("protocol", "0,1") // 0 = http_stream(flv), 1 = http_hls(m3u8)
+	uq.Set("protocol", "0")   // 0 = http_stream(flv), 1 = http_hls(m3u8)
 	uq.Set("format", "0,1,2") // 0 = flv, 1 = ts, 2 = fmp4
 	uq.Set("codec", "0,1")    // 0 = avc, 1 = hevc
 	uq.Set("qn", "10000")

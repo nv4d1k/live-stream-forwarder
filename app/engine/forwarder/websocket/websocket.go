@@ -7,13 +7,15 @@ import (
 	"net/url"
 
 	"github.com/gin-gonic/gin"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
 type WebSocketForwarder struct {
-	stopCh chan struct{}
-	proxy  *url.URL
-	mobile bool
+	stopCh    chan struct{}
+	proxy     *url.URL
+	mobile    bool
+	extractFn stream.ExtractFunc
 }
 
 func NewWebSocketForwarder(proxy *url.URL, mobile bool) Foreground {
@@ -21,6 +23,17 @@ func NewWebSocketForwarder(proxy *url.URL, mobile bool) Foreground {
 		stopCh: make(chan struct{}),
 		proxy:  proxy,
 		mobile: mobile,
+	}
+}
+
+// NewWebSocketForwarderWithRetry creates a forwarder that will reconnect
+// using extractFn when the upstream connection fails with a retriable error.
+func NewWebSocketForwarderWithRetry(proxy *url.URL, mobile bool, extractFn stream.ExtractFunc) Foreground {
+	return &WebSocketForwarder{
+		stopCh:    make(chan struct{}),
+		proxy:     proxy,
+		mobile:    mobile,
+		extractFn: extractFn,
 	}
 }
 
@@ -43,7 +56,11 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	var st Background
 	switch ux.Scheme {
 	case "ws", "wss":
-		st = NewXP2PClient(u, s.httpHeader(), s.proxy)
+		if s.extractFn != nil {
+			st = NewXP2PClientWithRetry(s.extractFn, s.httpHeader(), s.proxy)
+		} else {
+			st = NewXP2PClient(u, s.httpHeader(), s.proxy)
+		}
 	default:
 		return fmt.Errorf("unknown protocol: %s", ux.Scheme)
 	}
@@ -53,15 +70,6 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 		return err
 	}
 	w := c.Writer
-	/*w.Header().Set("Content-Type", "video/x-flv")
-	w.Header().Set("Transfer-Encoding", "identity")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "*")
-	w.WriteHeader(200)
-	w.Flush()*/
 
 	conn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
