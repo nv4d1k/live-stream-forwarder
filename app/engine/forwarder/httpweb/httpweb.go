@@ -25,8 +25,9 @@ func NewHTTPWebForwarder(proxy *url.URL, mobile bool) *HTTPWebForwarder {
 
 // Stream returns a *stream.Stream that continuously fetches and pipes data from
 // the upstream. When a 403 is encountered, extractFn is called to get a fresh URL.
-func (h *HTTPWebForwarder) Stream(extractFn stream.ExtractFunc) *stream.Stream {
-	return stream.NewStream(extractFn, h.fetch)
+// opts can be used to configure the stream (e.g. WithWriterWrapper for FLV header caching).
+func (h *HTTPWebForwarder) Stream(extractFn stream.ExtractFunc, opts ...stream.StreamOption) *stream.Stream {
+	return stream.NewStream(extractFn, h.fetch, opts...)
 }
 
 // fetch makes a GET request and returns the response body.

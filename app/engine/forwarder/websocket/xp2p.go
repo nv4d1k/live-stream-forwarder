@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	ws "github.com/gorilla/websocket"
@@ -59,7 +60,8 @@ func NewXP2PClient(u string, header http.Header, proxy *url.URL) Background {
 
 // NewXP2PClientWithRetry creates a client that will reconnect with a new URL
 // from extractFn when the connection fails with a retriable error (e.g. 403).
-func NewXP2PClientWithRetry(extractFn stream.ExtractFunc, header http.Header, proxy *url.URL) Background {
+// cacheKey enables FLV header caching; empty string disables it.
+func NewXP2PClientWithRetry(extractFn stream.ExtractFunc, header http.Header, proxy *url.URL, cacheKey string) Background {
 	c := &client{
 		header: header,
 		dialer: &ws.Dialer{
@@ -90,6 +92,7 @@ func NewXP2PClientWithRetry(extractFn stream.ExtractFunc, header http.Header, pr
 		},
 		pipe:      stream.NewPipe(),
 		extractFn: extractFn,
+		cacheKey:  cacheKey,
 	}
 	if proxy != nil {
 		c.dialer.Proxy = http.ProxyURL(proxy)
@@ -101,15 +104,17 @@ func NewXP2PClientWithRetry(extractFn stream.ExtractFunc, header http.Header, pr
 }
 
 type client struct {
-	mu        sync.Mutex
-	url       string
-	header    http.Header
-	dialer    *ws.Dialer
-	conn      *ws.Conn
-	stopCh    chan struct{}
-	pipe      *stream.Pipe
-	extractFn stream.ExtractFunc
-	previous  *stream.ExtractResult
+	mu           sync.Mutex
+	url          string
+	header       http.Header
+	dialer       *ws.Dialer
+	conn         *ws.Conn
+	stopCh       chan struct{}
+	pipe         *stream.Pipe
+	extractFn    stream.ExtractFunc
+	previous     *stream.ExtractResult
+	cacheKey     string
+	headerWriter *flv.HeaderCacheWriter
 }
 
 func (c *client) Start() error {
@@ -187,6 +192,8 @@ func (c *client) ReadLoop() {
 				}
 				c.url = result.URL
 				c.previous = result
+				// Reset header writer so the new stream's header is re-detected.
+				c.headerWriter = nil
 				c.mu.Lock()
 				conn, resp, dialErr := c.dialer.DialContext(context.TODO(), c.url, c.header)
 				c.mu.Unlock()
@@ -209,7 +216,17 @@ func (c *client) ReadLoop() {
 		}
 		switch mt {
 		case ws.BinaryMessage:
-			c.pipe.Write(body)
+			if c.cacheKey != "" {
+				if c.headerWriter == nil {
+					c.headerWriter = flv.NewHeaderCacheWriter(c.pipe, flv.DefaultCache, c.cacheKey)
+				}
+				if _, writeErr := c.headerWriter.Write(body); writeErr != nil {
+					c.pipe.CloseWithError(writeErr)
+					return
+				}
+			} else {
+				c.pipe.Write(body)
+			}
 		case ws.TextMessage:
 		case ws.CloseMessage:
 			c.pipe.CloseWithError(err)

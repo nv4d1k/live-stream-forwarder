@@ -78,7 +78,7 @@ func (l *Link) getLinkByAPIv1() (*url.URL, error) {
 	return nil, errors.New("no stream found")
 }
 
-func (l *Link) getLinkByAPIv2() (*url.URL, error) {
+func (l *Link) getLinkByAPIv2(format string) (*url.URL, error) {
 	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.getLinkByAPIv2")
 	u, err := url.Parse("https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo")
 	if err != nil {
@@ -86,7 +86,11 @@ func (l *Link) getLinkByAPIv2() (*url.URL, error) {
 	}
 	uq := u.Query()
 	uq.Set("room_id", l.rid)
-	uq.Set("protocol", "0")   // 0 = http_stream(flv), 1 = http_hls(m3u8)
+	protocol := "0" // 0 = http_stream(flv), 1 = http_hls(m3u8)
+	if format == "m3u8" || format == "hls" {
+		protocol = "1"
+	}
+	uq.Set("protocol", protocol)
 	uq.Set("format", "0,1,2") // 0 = flv, 1 = ts, 2 = fmp4
 	uq.Set("codec", "0,1")    // 0 = avc, 1 = hevc
 	uq.Set("qn", "10000")
@@ -136,14 +140,20 @@ func (l *Link) getLinkByAPIv2() (*url.URL, error) {
 	return url.Parse(urls[r.Intn(len(urls)-1)])
 }
 
-func (l *Link) GetLink() (*url.URL, error) {
+// GetLink returns a stream URL. The format parameter selects the desired
+// stream format: "flv" for HTTP-FLV, "m3u8" or "hls" for HLS. When format
+// is empty, the API default (FLV) is used.
+func (l *Link) GetLink(format string) (*url.URL, error) {
 	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.GetLink")
-	u, err := l.getLinkByAPIv1()
-	if err == nil {
-		return u, nil
+	// v1 API only supports FLV; skip it when HLS is requested.
+	if format == "" || format == "flv" {
+		u, err := l.getLinkByAPIv1()
+		if err == nil {
+			return u, nil
+		}
+		log.Errorf("trying get stream by api v1 error: %s\n", err.Error())
 	}
-	log.Errorf("trying get stream by api v1 error: %s\n", err.Error())
-	u, err = l.getLinkByAPIv2()
+	u, err := l.getLinkByAPIv2(format)
 	if err != nil {
 		return nil, fmt.Errorf("trying get stream by api v2 error: %w", err)
 	}

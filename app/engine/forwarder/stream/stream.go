@@ -26,24 +26,43 @@ type ExtractResult struct {
 // FetchFunc returns the upstream response body for a given URL.
 type FetchFunc func(u string, headers http.Header) (io.ReadCloser, error)
 
+// WriterWrapperFunc wraps an io.Writer with additional behavior.
+// Called once per produce iteration to create the writer target for io.Copy.
+type WriterWrapperFunc func(io.Writer) io.Writer
+
+// StreamOption configures a Stream during creation.
+type StreamOption func(*Stream)
+
+// WithWriterWrapper sets a function that wraps the pipe writer on each
+// produce iteration, allowing interception of data written to the pipe
+// (e.g. for FLV header caching).
+func WithWriterWrapper(fn WriterWrapperFunc) StreamOption {
+	return func(s *Stream) { s.writerWrapper = fn }
+}
+
 // Stream wraps a Pipe so that a consumer reads continuously while a producer
 // goroutine feeds data in. When the producer encounters a 403 (URL expired),
 // it calls the ExtractFunc to get a fresh URL and reconnects — the consumer
 // never sees a break.
 type Stream struct {
-	pipe      *Pipe
-	done      chan struct{}
-	closeErr  error
-	closeOnce sync.Once
+	pipe          *Pipe
+	done          chan struct{}
+	closeErr      error
+	closeOnce     sync.Once
+	writerWrapper WriterWrapperFunc
 }
 
 // NewStream creates a Stream and starts the producer goroutine.
 // extractFn is called on first connect and on every 403 retry.
 // fetchFn is called to actually fetch the stream data given a URL.
-func NewStream(extractFn ExtractFunc, fetchFn FetchFunc) *Stream {
+// opts can be used to configure the stream (e.g. WithWriterWrapper).
+func NewStream(extractFn ExtractFunc, fetchFn FetchFunc, opts ...StreamOption) *Stream {
 	s := &Stream{
 		pipe: NewPipe(),
 		done: make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	go s.produce(extractFn, fetchFn)
 	return s
@@ -97,7 +116,11 @@ func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 		}
 
 		previous = result
-		_, err = io.Copy(s.pipe, body)
+		var w io.Writer = s.pipe
+		if s.writerWrapper != nil {
+			w = s.writerWrapper(s.pipe)
+		}
+		_, err = io.Copy(w, body)
 		body.Close()
 
 		if s.pipe.Err() != nil {

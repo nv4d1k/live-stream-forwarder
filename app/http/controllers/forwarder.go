@@ -2,6 +2,8 @@ package controllers
 
 import (
 	"fmt"
+	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"path"
@@ -13,6 +15,7 @@ import (
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/DouYu"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/HuYa"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/Twitch"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/hls"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
@@ -20,19 +23,10 @@ import (
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
-// buildPrefix constructs the self-referencing URL prefix for HLS URL rewriting.
-func buildPrefix(c *gin.Context) string {
-	scheme := "http"
-	if c.Request.TLS != nil || c.Request.Header.Get("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	return fmt.Sprintf("%s://%s%s", scheme, c.Request.Host, c.Request.URL.Path)
-}
-
-// streamToClient writes data from a *stream.Stream to the gin context as a
-// long-lived HTTP stream (FLV or raw binary). The client sees a single
-// continuous response even if the producer reconnects on 403.
-func streamToClient(c *gin.Context, s *stream.Stream, contentType string) {
+// streamToClient writes data from an io.ReadCloser to the gin context as a
+// long-lived HTTP stream. The client sees a single continuous response
+// even if the producer reconnects on 403.
+func streamToClient(c *gin.Context, r io.ReadCloser, contentType string) {
 	c.Writer.Header().Set("Content-Type", contentType)
 	c.Writer.Header().Set("Transfer-Encoding", "identity")
 	c.Writer.Header().Set("Connection", "close")
@@ -45,36 +39,19 @@ func streamToClient(c *gin.Context, s *stream.Stream, contentType string) {
 
 	buf := make([]byte, 65536)
 	for {
-		n, err := s.Read(buf)
+		n, err := r.Read(buf)
 		if n > 0 {
 			if _, writeErr := c.Writer.Write(buf[:n]); writeErr != nil {
-				s.Close()
+				r.Close()
 				return
 			}
 			c.Writer.Flush()
 		}
 		if err != nil {
+			r.Close()
 			return
 		}
 	}
-}
-
-// handleSegment403 redirects to the main room URL when a segment request
-// returns 403. This causes the player to re-fetch the playlist through the
-// initial request path which has full pipe-based retry support.
-func handleSegment403(c *gin.Context, platform, room, format string) {
-	redirectURL := fmt.Sprintf("/%s/%s", platform, room)
-	q := url.Values{}
-	if format != "" {
-		q.Set("format", format)
-	}
-	if p := c.DefaultQuery("proxy", ""); p != "" {
-		q.Set("proxy", p)
-	}
-	if len(q) > 0 {
-		redirectURL += "?" + q.Encode()
-	}
-	c.Redirect(302, redirectURL)
 }
 
 // formatFromURL determines the stream format from a URL: "ws", "flv", "m3u8", etc.
@@ -85,6 +62,28 @@ func formatFromURL(u *url.URL) string {
 	default:
 		return strings.TrimPrefix(path.Ext(u.Path), ".")
 	}
+}
+
+// resolveDesiredFormat determines the desired stream format from the query
+// parameter. If no format is specified, it randomly selects "flv" or "m3u8".
+func resolveDesiredFormat(queryFormat string) string {
+	if queryFormat != "" {
+		return queryFormat
+	}
+	if rand.Intn(2) == 0 {
+		return "flv"
+	}
+	return "m3u8"
+}
+
+// flvStreamWithCache creates an FLV stream with header caching support.
+func flvStreamWithCache(extractFn stream.ExtractFunc, proxyURL *url.URL, mobile bool, key string) io.ReadCloser {
+	f := httpweb.NewHTTPWebForwarder(proxyURL, mobile)
+	writerWrapper := func(w io.Writer) io.Writer {
+		return flv.NewHeaderCacheWriter(w, flv.DefaultCache, key)
+	}
+	s := f.Stream(extractFn, stream.WithWriterWrapper(writerWrapper))
+	return flv.NewFLVStream(s, flv.DefaultCache, key)
 }
 
 func Forwarder(c *gin.Context) {
@@ -111,42 +110,26 @@ func Forwarder(c *gin.Context) {
 	}
 	log = log.WithField("platform", strings.ToLower(c.Param("platform"))).WithField("room", c.Param("room"))
 
-	pp := c.DefaultQuery("url", "")
-	prefix := buildPrefix(c)
-
 	switch strings.ToLower(c.Param("platform")) {
 	case "douyu":
-		if pp != "" {
-			// Segment request
-			p := hls.NewHLSForwarder(proxyURL, false)
-			err := p.Forward(c, pp, prefix)
-			if err != nil {
-				if strings.Contains(err.Error(), "403") {
-					handleSegment403(c, "douyu", c.Param("room"), format)
-					return
-				}
-				log.Errorf("forward hls stream error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
-			}
-			return
-		}
-
-		// initialFormat tracks the format from the first successful extraction,
-		// so retries can ensure the same format is returned.
+		desiredFormat := resolveDesiredFormat(format)
 		var initialFormat string
 		extractFn := func(previous *stream.ExtractResult) (*stream.ExtractResult, error) {
 			dy, err := DouYu.NewDouyuLink(c.Param("room"), proxyURL)
 			if err != nil {
 				return nil, fmt.Errorf("create link object error: %w", err)
 			}
-			u, err := dy.GetLink()
+			// On retry, pass the known format so the extractor targets it.
+			extractFormat := desiredFormat
+			if previous != nil {
+				extractFormat = initialFormat
+			}
+			u, err := dy.GetLink(extractFormat)
 			if err != nil {
 				return nil, fmt.Errorf("get link error: %w", err)
 			}
 			result := &stream.ExtractResult{URL: u.String()}
 			if previous != nil {
-				// Validate format consistency on retry
 				newFmt := formatFromURL(u)
 				if newFmt != initialFormat {
 					return nil, fmt.Errorf("format changed from %s to %s, will retry", initialFormat, newFmt)
@@ -164,13 +147,12 @@ func Forwarder(c *gin.Context) {
 			return
 		}
 		u, _ := url.Parse(result.URL)
+		key := fmt.Sprintf("douyu:%s", c.Param("room"))
 		switch u.Scheme {
 		case "http", "https":
-			f := httpweb.NewHTTPWebForwarder(proxyURL, false)
-			s := f.Stream(extractFn)
-			streamToClient(c, s, "video/x-flv")
+			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, false, key), "video/x-flv")
 		case "ws", "wss":
-			f := websocket.NewWebSocketForwarderWithRetry(proxyURL, false, extractFn)
+			f := websocket.NewWebSocketForwarderWithRetry(proxyURL, false, extractFn, key)
 			err = f.Start(c, result.URL)
 			if err != nil {
 				log.Errorf("forward ws(s) stream error: %s\n", err.Error())
@@ -183,28 +165,19 @@ func Forwarder(c *gin.Context) {
 		return
 
 	case "huya":
-		if pp != "" {
-			p := hls.NewHLSForwarder(proxyURL, true)
-			err := p.Forward(c, pp, prefix)
-			if err != nil {
-				if strings.Contains(err.Error(), "403") {
-					handleSegment403(c, "huya", c.Param("room"), format)
-					return
-				}
-				log.WithField("url", pp).Errorf("forward hls stream error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
-			}
-			return
-		}
-
+		desiredFormat := resolveDesiredFormat(format)
 		var initialFormat string
 		extractFn := func(previous *stream.ExtractResult) (*stream.ExtractResult, error) {
 			link, err := HuYa.NewHuyaLink(c.Param("room"), proxyURL)
 			if err != nil {
 				return nil, fmt.Errorf("create link object error: %w", err)
 			}
-			u, err := link.GetLink(format)
+			// On retry, use the known format to avoid format switching.
+			extractFormat := desiredFormat
+			if previous != nil {
+				extractFormat = initialFormat
+			}
+			u, err := link.GetLink(extractFormat)
 			if err != nil {
 				return nil, fmt.Errorf("get link error: %w", err)
 			}
@@ -227,19 +200,14 @@ func Forwarder(c *gin.Context) {
 			return
 		}
 		u, _ := url.Parse(result.URL)
+		key := fmt.Sprintf("huya:%s", c.Param("room"))
 		switch path.Ext(u.Path) {
 		case ".m3u8":
-			p := hls.NewHLSForwarder(proxyURL, true)
-			err := p.WrapPlaylist(c, result.URL, prefix)
-			if err != nil {
-				log.Errorf("wrap play list error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
-			}
+			h := hls.NewHLSForwarder(proxyURL, true)
+			s := h.Stream(extractFn)
+			streamToClient(c, s, "video/mp2t")
 		case ".flv":
-			f := httpweb.NewHTTPWebForwarder(proxyURL, true)
-			s := f.Stream(extractFn)
-			streamToClient(c, s, "video/x-flv")
+			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, true, key), "video/x-flv")
 		default:
 			c.String(500, "unsupported format")
 			return
@@ -247,58 +215,25 @@ func Forwarder(c *gin.Context) {
 		return
 
 	case "twitch":
-		if pp != "" {
-			p := hls.NewHLSForwarder(proxyURL, false)
-			err := p.Forward(c, pp, prefix)
+		extractFn := func(previous *stream.ExtractResult) (*stream.ExtractResult, error) {
+			link, err := Twitch.NewTwitchLink(c.Param("room"), proxyURL)
 			if err != nil {
-				if strings.Contains(err.Error(), "403") {
-					handleSegment403(c, "twitch", c.Param("room"), format)
-					return
-				}
-				log.Errorf("forward hls stream error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
+				return nil, fmt.Errorf("create link object error: %w", err)
 			}
-			return
+			u, err := link.GetLink("m3u8")
+			if err != nil {
+				return nil, fmt.Errorf("get link error: %w", err)
+			}
+			return &stream.ExtractResult{URL: u.String()}, nil
 		}
 
-		link, err := Twitch.NewTwitchLink(c.Param("room"), proxyURL)
-		if err != nil {
-			log.Errorf("create link object error: %s\n", err.Error())
-			c.String(500, err.Error())
-			return
-		}
-		u, err := link.GetLink()
-		if err != nil {
-			log.Errorf("get link error: %s\n", err.Error())
-			c.String(500, err.Error())
-			return
-		}
-		p := hls.NewHLSForwarder(proxyURL, false)
-		err = p.ForwardM3u8(c, u.String(), prefix)
-		if err != nil {
-			log.Errorf("forward playlist error: %s\n", err.Error())
-			c.String(400, err.Error())
-			return
-		}
+		h := hls.NewHLSForwarder(proxyURL, false)
+		s := h.Stream(extractFn)
+		streamToClient(c, s, "video/mp2t")
 		return
 
 	case "bilibili":
-		if pp != "" {
-			p := hls.NewHLSForwarder(proxyURL, false)
-			err := p.Forward(c, pp, prefix)
-			if err != nil {
-				if strings.Contains(err.Error(), "403") {
-					handleSegment403(c, "bilibili", c.Param("room"), format)
-					return
-				}
-				log.Errorf("forward hls stream error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
-			}
-			return
-		}
-
+		desiredFormat := resolveDesiredFormat(format)
 		headers := make(http.Header)
 		headers.Set("Referer", "https://live.bilibili.com")
 		var initialFormat string
@@ -307,7 +242,12 @@ func Forwarder(c *gin.Context) {
 			if err != nil {
 				return nil, fmt.Errorf("create link object error: %w", err)
 			}
-			u, err := link.GetLink()
+			// On retry, use the known format to avoid format switching.
+			extractFormat := desiredFormat
+			if previous != nil {
+				extractFormat = initialFormat
+			}
+			u, err := link.GetLink(extractFormat)
 			if err != nil {
 				return nil, fmt.Errorf("get link error: %w", err)
 			}
@@ -330,19 +270,14 @@ func Forwarder(c *gin.Context) {
 			return
 		}
 		u, _ := url.Parse(result.URL)
+		key := fmt.Sprintf("bilibili:%s", c.Param("room"))
 		switch path.Ext(u.Path) {
 		case ".m3u8":
-			p := hls.NewHLSForwarder(proxyURL, false)
-			err := p.WrapPlaylist(c, result.URL, prefix)
-			if err != nil {
-				log.Errorf("wrap play list error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
-			}
+			h := hls.NewHLSForwarder(proxyURL, false)
+			s := h.Stream(extractFn)
+			streamToClient(c, s, "video/mp2t")
 		case ".flv":
-			f := httpweb.NewHTTPWebForwarder(proxyURL, false)
-			s := f.Stream(extractFn)
-			streamToClient(c, s, "video/x-flv")
+			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, false, key), "video/x-flv")
 		default:
 			c.String(500, "unsupported format")
 			return
@@ -350,28 +285,19 @@ func Forwarder(c *gin.Context) {
 		return
 
 	case "douyin":
-		if pp != "" {
-			p := hls.NewHLSForwarder(proxyURL, false)
-			err := p.Forward(c, pp, prefix)
-			if err != nil {
-				if strings.Contains(err.Error(), "403") {
-					handleSegment403(c, "douyin", c.Param("room"), format)
-					return
-				}
-				log.Errorf("forward hls stream error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
-			}
-			return
-		}
-
+		desiredFormat := resolveDesiredFormat(format)
 		var initialFormat string
 		extractFn := func(previous *stream.ExtractResult) (*stream.ExtractResult, error) {
 			link, err := DouYin.NewDouYinLink(c.Param("room"), proxyURL)
 			if err != nil {
 				return nil, fmt.Errorf("create link object error: %w", err)
 			}
-			u, err := link.GetLink(format)
+			// On retry, use the known format to avoid format switching.
+			extractFormat := desiredFormat
+			if previous != nil {
+				extractFormat = initialFormat
+			}
+			u, err := link.GetLink(extractFormat)
 			if err != nil {
 				return nil, fmt.Errorf("get link error: %w", err)
 			}
@@ -394,19 +320,14 @@ func Forwarder(c *gin.Context) {
 			return
 		}
 		u, _ := url.Parse(result.URL)
+		key := fmt.Sprintf("douyin:%s", c.Param("room"))
 		switch path.Ext(u.Path) {
 		case ".m3u8":
-			p := hls.NewHLSForwarder(proxyURL, false)
-			err := p.WrapPlaylist(c, result.URL, prefix)
-			if err != nil {
-				log.Errorf("wrap play list error: %s\n", err.Error())
-				c.String(400, err.Error())
-				return
-			}
+			h := hls.NewHLSForwarder(proxyURL, false)
+			s := h.Stream(extractFn)
+			streamToClient(c, s, "video/mp2t")
 		case ".flv":
-			f := httpweb.NewHTTPWebForwarder(proxyURL, false)
-			s := f.Stream(extractFn)
-			streamToClient(c, s, "video/x-flv")
+			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, false, key), "video/x-flv")
 		default:
 			c.String(500, "unsupported format")
 			return
