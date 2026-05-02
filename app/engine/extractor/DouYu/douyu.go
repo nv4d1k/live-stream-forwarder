@@ -76,7 +76,10 @@ func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 	return dy, nil
 }
 
-func (l *Link) GetLink() (*url.URL, error) {
+// GetLink returns a stream URL. The format parameter is accepted for
+// interface consistency but DouYu's stream format is determined by the
+// server's p2p field; it cannot be selected by the caller.
+func (l *Link) GetLink(_ string) (*url.URL, error) {
 	log := global.Log.WithField("function", "app.engine.extractor.DouYu.GetLink")
 	data, err := l.getRateStream()
 	log.WithField("data", data.Raw).Debugln("rate stream data")

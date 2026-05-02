@@ -44,7 +44,9 @@ func NewTwitchLink(rid string, proxy *url.URL) (*Link, error) {
 	return tw, nil
 }
 
-func (l *Link) GetLink() (*url.URL, error) {
+// GetLink returns a stream URL. The format parameter is accepted for
+// interface consistency; Twitch only provides HLS streams.
+func (l *Link) GetLink(_ string) (*url.URL, error) {
 	params := url.Values{}
 	params.Add("allow_source", "true")
 	params.Add("fast_bread", "true")

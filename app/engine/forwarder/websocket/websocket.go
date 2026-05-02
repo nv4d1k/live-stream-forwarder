@@ -7,6 +7,7 @@ import (
 	"net/url"
 
 	"github.com/gin-gonic/gin"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
@@ -16,6 +17,7 @@ type WebSocketForwarder struct {
 	proxy     *url.URL
 	mobile    bool
 	extractFn stream.ExtractFunc
+	cacheKey  string
 }
 
 func NewWebSocketForwarder(proxy *url.URL, mobile bool) Foreground {
@@ -28,12 +30,14 @@ func NewWebSocketForwarder(proxy *url.URL, mobile bool) Foreground {
 
 // NewWebSocketForwarderWithRetry creates a forwarder that will reconnect
 // using extractFn when the upstream connection fails with a retriable error.
-func NewWebSocketForwarderWithRetry(proxy *url.URL, mobile bool, extractFn stream.ExtractFunc) Foreground {
+// cacheKey enables FLV header caching; empty string disables it.
+func NewWebSocketForwarderWithRetry(proxy *url.URL, mobile bool, extractFn stream.ExtractFunc, cacheKey string) Foreground {
 	return &WebSocketForwarder{
 		stopCh:    make(chan struct{}),
 		proxy:     proxy,
 		mobile:    mobile,
 		extractFn: extractFn,
+		cacheKey:  cacheKey,
 	}
 }
 
@@ -57,7 +61,7 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	switch ux.Scheme {
 	case "ws", "wss":
 		if s.extractFn != nil {
-			st = NewXP2PClientWithRetry(s.extractFn, s.httpHeader(), s.proxy)
+			st = NewXP2PClientWithRetry(s.extractFn, s.httpHeader(), s.proxy, s.cacheKey)
 		} else {
 			st = NewXP2PClient(u, s.httpHeader(), s.proxy)
 		}
@@ -94,6 +98,20 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	if err != nil {
 		log.WithError(err).Errorln("write frontend error")
 		return err
+	}
+
+	// Send cached FLV header to the client if available.
+	if s.cacheKey != "" {
+		entry := flv.DefaultCache.GetOrCreate(s.cacheKey)
+		entry.Wait()
+		if data := entry.Data(); data != nil {
+			if _, writeErr := conn.Write(data); writeErr != nil {
+				log.WithError(writeErr).Errorln("write cached header error")
+				st.Close()
+				conn.Close()
+				return writeErr
+			}
+		}
 	}
 
 	go func() {
