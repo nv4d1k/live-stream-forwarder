@@ -10,10 +10,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/tidwall/gjson"
 )
+
+func init() {
+	extractor.Register("bilibili", extractor.RegistryEntry{
+		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
+			return NewBiliBiliLink(rid, proxy)
+		},
+		Mobile:       true,
+		InitialError: 500,
+	})
+}
 
 type Link struct {
 	rid    string
@@ -138,6 +149,27 @@ func (l *Link) getLinkByAPIv2(format string) (*url.URL, error) {
 	}
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 	return url.Parse(urls[r.Intn(len(urls)-1)])
+}
+
+func (l *Link) Extract(format string) (*extractor.Result, error) {
+	if format == "" {
+		format = l.DefaultFormat()
+	}
+	u, err := l.GetLink(format)
+	if err != nil {
+		return nil, err
+	}
+	headers := make(http.Header)
+	headers.Set("Referer", "https://live.bilibili.com")
+	return &extractor.Result{URL: u.String(), Headers: headers}, nil
+}
+
+func (l *Link) SupportedFormats() []string {
+	return []string{"flv", "m3u8"}
+}
+
+func (l *Link) DefaultFormat() string {
+	return "flv"
 }
 
 // GetLink returns a stream URL. The format parameter selects the desired

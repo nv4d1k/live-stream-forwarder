@@ -100,3 +100,5 @@ Temporary Items
 *.log
 
 *.local.md
+.claude
+lsf

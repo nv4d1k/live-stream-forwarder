@@ -115,7 +115,7 @@ func (s *HLSStream) produce() {
 				mediaPlaylistURL = ""
 				continue
 			}
-			variant := masterpl.Variants[0]
+			variant := pickHighestBandwidthVariant(masterpl.Variants)
 			resolved := resolveURL(mediaPlaylistURL, variant.URI)
 			mediaPlaylistURL = resolved
 			continue // Re-fetch as media playlist.
@@ -248,4 +248,14 @@ func isRetriableHLS(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "403")
+}
+
+func pickHighestBandwidthVariant(variants []*libm3u8.Variant) *libm3u8.Variant {
+	best := variants[0]
+	for _, v := range variants[1:] {
+		if v.Bandwidth > best.Bandwidth {
+			best = v
+		}
+	}
+	return best
 }
