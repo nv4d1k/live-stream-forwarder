@@ -1,19 +1,17 @@
 package BiliBili
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
-	"strings"
-	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/global"
-	"github.com/tidwall/gjson"
 )
 
 func init() {
@@ -21,7 +19,7 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewBiliBiliLink(rid, proxy)
 		},
-		Mobile:       true,
+		Mobile:       false,
 		InitialError: 500,
 	})
 }
@@ -31,25 +29,21 @@ type Link struct {
 	client *http.Client
 }
 
-func NewBiliBiliLink(rid string, proxy *url.URL) (bili *Link, err error) {
-	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.NewBiliBiliLink")
-	bili = new(Link)
-	bili.rid = rid
+func NewBiliBiliLink(rid string, proxy *url.URL) (*Link, error) {
+	l := &Link{rid: rid}
 	if proxy != nil {
-		bili.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, true)}
+		l.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, false)}
 	} else {
-		bili.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, true)}
+		l.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
 	}
-	err = bili.getRoomStatus()
-	if err != nil {
-		return nil, fmt.Errorf("get room status error: %w", err)
+	if err := l.resolveRoomID(); err != nil {
+		return nil, err
 	}
-	log.WithField("field", "real room id").Debug(bili.rid)
-	return bili, nil
+	return l, nil
 }
 
-func (l *Link) getRoomStatus() error {
-	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.getRoomStatus")
+func (l *Link) resolveRoomID() error {
+	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.resolveRoomID")
 	resp, err := l.client.Get(fmt.Sprintf("https://api.live.bilibili.com/room/v1/Room/room_init?id=%s", l.rid))
 	if err != nil {
 		return fmt.Errorf("get room init info error: %w", err)
@@ -57,98 +51,27 @@ func (l *Link) getRoomStatus() error {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("parse room init info body error: %w", err)
+		return fmt.Errorf("read room init info error: %w", err)
 	}
 	log.WithField("field", "room init data").Debug(string(body))
-	if gjson.ParseBytes(body).Get("code").Int() != 0 {
-		return errors.New("live streaming room not exist")
+	var result roomInitResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("parse room init info error: %w", err)
 	}
-	l.rid = gjson.ParseBytes(body).Get("data.room_id").String()
-	if gjson.ParseBytes(body).Get("data.live_status").Int() != 1 {
-		return errors.New("live streaming room is offline")
+	if result.Code != 0 {
+		return errors.New("live room does not exist")
+	}
+	l.rid = fmt.Sprintf("%d", result.Data.RoomID)
+	if result.Data.LiveStatus != 1 {
+		return errors.New("live room is offline")
+	}
+	if result.Data.IsLocked {
+		return errors.New("live room is locked")
+	}
+	if result.Data.Encrypted {
+		return errors.New("live room is encrypted (password required)")
 	}
 	return nil
-}
-
-func (l *Link) getLinkByAPIv1() (*url.URL, error) {
-	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.getLinkByAPIv1")
-	resp, err := l.client.Get(fmt.Sprintf("https://api.live.bilibili.com/xlive/web-room/v1/playUrl/playUrl?&https_url_req=1&qn=10000&platform=web&ptype=16&cid=%s", l.rid))
-	if err != nil {
-		return nil, fmt.Errorf("get api v1 response error: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("parse api v1 response error: %w", err)
-	}
-	log.WithField("field", "api response").Debug(string(body))
-	data := gjson.ParseBytes(body).Get("data")
-	if data.Get("durl.0.url").Exists() && data.Get("durl.0.url").String() != "" {
-		return url.Parse(data.Get("durl.0.url").String())
-	}
-	return nil, errors.New("no stream found")
-}
-
-func (l *Link) getLinkByAPIv2(format string) (*url.URL, error) {
-	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.getLinkByAPIv2")
-	u, err := url.Parse("https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo")
-	if err != nil {
-		return nil, fmt.Errorf("parsing room play info url error: %w", err)
-	}
-	uq := u.Query()
-	uq.Set("room_id", l.rid)
-	protocol := "0" // 0 = http_stream(flv), 1 = http_hls(m3u8)
-	if format == "m3u8" || format == "hls" {
-		protocol = "1"
-	}
-	uq.Set("protocol", protocol)
-	uq.Set("format", "0,1,2") // 0 = flv, 1 = ts, 2 = fmp4
-	uq.Set("codec", "0,1")    // 0 = avc, 1 = hevc
-	uq.Set("qn", "10000")
-	uq.Set("platform", "h5")
-	uq.Set("ptype", "8")
-	u.RawQuery = uq.Encode()
-	log.WithField("field", "rebuilt room play info url").Debug(u.String())
-	resp, err := l.client.Get(u.String())
-	if err != nil {
-		return nil, fmt.Errorf("get room play info error: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("parsing room play info error: %w", err)
-	}
-	log.WithField("field", "room play info").Debug(string(body))
-	streamsdata := gjson.ParseBytes(body).Get("data.playurl_info.playurl.stream")
-	if !streamsdata.Exists() {
-		return nil, errors.New("live streams not found")
-	}
-	var (
-		urls     []string
-		parsestr string
-	)
-	parsestr = "#.format.#.codec.#|@flatten"
-	if len(streamsdata.Get("#.format.#.codec.#(current_qn>=10000)|@flatten").Array()) > 0 {
-		parsestr = "#.format.#.codec.#(current_qn>=10000)|@flatten"
-	} else if len(streamsdata.Get("#.format.#.codec.#(current_qn>=80)|@flatten").Array()) > 0 {
-		parsestr = "#.format.#.codec.#(current_qn>=80)|@flatten"
-	}
-	streamsdata.Get(parsestr).ForEach(func(ck, ci gjson.Result) bool {
-		ci.Get("url_info").ForEach(func(uk, ui gjson.Result) bool {
-			urls = append(urls, fmt.Sprintf("%s%s%s", ui.Get("host").String(), ci.Get("base_url").String(), ui.Get("extra").String()))
-			return true
-		})
-		return true
-	})
-	log.WithField("field", "parsed url").Debug(strings.Join(urls, "\n"))
-	if len(urls) <= 0 {
-		return nil, errors.New("no streams found")
-	}
-	if len(urls) == 1 {
-		return url.Parse(urls[0])
-	}
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-	return url.Parse(urls[r.Intn(len(urls)-1)])
 }
 
 func (l *Link) Extract(format string) (*extractor.Result, error) {
@@ -172,22 +95,241 @@ func (l *Link) DefaultFormat() string {
 	return "flv"
 }
 
-// GetLink returns a stream URL. The format parameter selects the desired
-// stream format: "flv" for HTTP-FLV, "m3u8" or "hls" for HLS. When format
-// is empty, the API default (FLV) is used.
 func (l *Link) GetLink(format string) (*url.URL, error) {
 	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.GetLink")
-	// v1 API only supports FLV; skip it when HLS is requested.
-	if format == "" || format == "flv" {
-		u, err := l.getLinkByAPIv1()
-		if err == nil {
-			return u, nil
-		}
-		log.Errorf("trying get stream by api v1 error: %s\n", err.Error())
+
+	// v1 API: returns direct stream URLs, often with higher quality for
+	// unauthenticated users than v2.
+	if u, err := l.getLinkByAPIv1(format); err == nil {
+		log.WithField("field", "stream url (v1)").Debug(u.String())
+		return u, nil
 	}
-	u, err := l.getLinkByAPIv2(format)
+
+	// Fallback to v2 API.
+	playInfo, err := l.getPlayInfo()
 	if err != nil {
-		return nil, fmt.Errorf("trying get stream by api v2 error: %w", err)
+		return nil, err
 	}
-	return u, nil
+	streamURL, err := selectStreamURL(playInfo, format)
+	if err != nil {
+		return nil, err
+	}
+	log.WithField("field", "stream url (v2)").Debug(streamURL)
+	return url.Parse(streamURL)
+}
+
+func (l *Link) getLinkByAPIv1(format string) (*url.URL, error) {
+	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.getLinkByAPIv1")
+	platform := "web"
+	if format == "m3u8" || format == "hls" {
+		platform = "h5"
+	}
+	resp, err := l.client.Get(fmt.Sprintf(
+		"https://api.live.bilibili.com/room/v1/Room/playUrl?cid=%s&platform=%s&qn=10000",
+		l.rid, platform,
+	))
+	if err != nil {
+		return nil, fmt.Errorf("v1 api request error: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("v1 api read body error: %w", err)
+	}
+	log.WithField("field", "v1 response").Debug(string(body))
+	var result playURLV1Response
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("v1 api parse error: %w", err)
+	}
+	if result.Code != 0 {
+		return nil, fmt.Errorf("v1 api error code %d", result.Code)
+	}
+	if len(result.Data.Durl) == 0 {
+		return nil, errors.New("v1 api returned no streams")
+	}
+	// Pick a random CDN node.
+	du := result.Data.Durl[rand.Intn(len(result.Data.Durl))]
+	if du.URL == "" {
+		return nil, errors.New("v1 api returned empty url")
+	}
+	return url.Parse(du.URL)
+}
+
+func (l *Link) getPlayInfo() (*playInfoResponse, error) {
+	log := global.Log.WithField("function", "app.engine.extractor.BiliBili.getPlayInfo")
+	u, _ := url.Parse("https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo")
+	q := u.Query()
+	q.Set("room_id", l.rid)
+	q.Set("protocol", "0,1")
+	q.Set("format", "0,1,2")
+	q.Set("codec", "0,1")
+	q.Set("qn", "10000")
+	q.Set("platform", "web")
+	q.Set("ptype", "8")
+	q.Set("dolby", "5")
+	q.Set("panorama", "1")
+	u.RawQuery = q.Encode()
+	log.WithField("field", "play info url").Debug(u.String())
+	resp, err := l.client.Get(u.String())
+	if err != nil {
+		return nil, fmt.Errorf("get play info error: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read play info error: %w", err)
+	}
+	log.WithField("field", "play info").Debug(string(body))
+	var result playInfoResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse play info error: %w", err)
+	}
+	if result.Code != 0 {
+		return nil, fmt.Errorf("play info api error code %d: %s", result.Code, result.Message)
+	}
+	if len(result.Data.PlayURLInfo.PlayURL.Streams) == 0 {
+		return nil, errors.New("no streams available")
+	}
+	return &result, nil
+}
+
+// selectStreamURL picks the best stream URL based on the requested format.
+// For "flv": selects http_stream/flv protocol.
+// For "m3u8": selects http_hls protocol, preferring fmp4 over ts.
+// Codec preference: avc (most compatible) > hevc.
+// CDN node: randomly selected from url_info for load balancing.
+func selectStreamURL(info *playInfoResponse, format string) (string, error) {
+	streams := info.Data.PlayURLInfo.PlayURL.Streams
+
+	var targetProtocol, targetFormat, fallbackFormat string
+	switch format {
+	case "m3u8", "hls":
+		targetProtocol = "http_hls"
+		targetFormat = "fmp4"
+		fallbackFormat = "ts"
+	default:
+		targetProtocol = "http_stream"
+		targetFormat = "flv"
+	}
+
+	// Find the matching protocol.
+	var targetStream *streamItem
+	for i := range streams {
+		if streams[i].ProtocolName == targetProtocol {
+			targetStream = &streams[i]
+			break
+		}
+	}
+	if targetStream == nil {
+		return "", fmt.Errorf("no %s stream available", targetProtocol)
+	}
+
+	// Find the matching format, with fallback for HLS.
+	var targetFmt *formatItem
+	for i := range targetStream.Formats {
+		if targetStream.Formats[i].FormatName == targetFormat {
+			targetFmt = &targetStream.Formats[i]
+			break
+		}
+	}
+	if targetFmt == nil && fallbackFormat != "" {
+		for i := range targetStream.Formats {
+			if targetStream.Formats[i].FormatName == fallbackFormat {
+				targetFmt = &targetStream.Formats[i]
+				break
+			}
+		}
+	}
+	if targetFmt == nil {
+		return "", fmt.Errorf("no %s/%s stream available", targetProtocol, targetFormat)
+	}
+
+	// Pick the best codec: prefer avc for compatibility, then highest current_qn.
+	var bestCodec *codecItem
+	for i := range targetFmt.Codecs {
+		c := &targetFmt.Codecs[i]
+		if bestCodec == nil {
+			bestCodec = c
+			continue
+		}
+		if c.CodecName == "avc" && bestCodec.CodecName != "avc" {
+			bestCodec = c
+		} else if c.CodecName == bestCodec.CodecName && c.CurrentQn > bestCodec.CurrentQn {
+			bestCodec = c
+		}
+	}
+	if bestCodec == nil || len(bestCodec.URLInfo) == 0 {
+		return "", errors.New("no codec/URL available for selected stream")
+	}
+
+	// Build the full URL from a random CDN node.
+	ui := bestCodec.URLInfo[rand.Intn(len(bestCodec.URLInfo))]
+	return ui.Host + bestCodec.BaseURL + ui.Extra, nil
+}
+
+// API response types
+
+type roomInitResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		RoomID     int  `json:"room_id"`
+		LiveStatus int  `json:"live_status"`
+		IsLocked   bool `json:"is_locked"`
+		Encrypted  bool `json:"encrypted"`
+	} `json:"data"`
+}
+
+type playInfoResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		RoomID     int `json:"room_id"`
+		LiveStatus int `json:"live_status"`
+		PlayURLInfo struct {
+			PlayURL struct {
+				CID     int          `json:"cid"`
+				QnDesc  []qnDescItem `json:"g_qn_desc"`
+				Streams []streamItem `json:"stream"`
+			} `json:"playurl"`
+		} `json:"playurl_info"`
+	} `json:"data"`
+}
+
+type qnDescItem struct {
+	Qn   int    `json:"qn"`
+	Desc string `json:"desc"`
+}
+
+type streamItem struct {
+	ProtocolName string       `json:"protocol_name"`
+	Formats      []formatItem `json:"format"`
+}
+
+type formatItem struct {
+	FormatName string      `json:"format_name"`
+	Codecs     []codecItem `json:"codec"`
+}
+
+type codecItem struct {
+	CodecName string    `json:"codec_name"`
+	CurrentQn int       `json:"current_qn"`
+	AcceptQn  []int     `json:"accept_qn"`
+	BaseURL   string    `json:"base_url"`
+	URLInfo   []urlItem `json:"url_info"`
+}
+
+type urlItem struct {
+	Host  string `json:"host"`
+	Extra string `json:"extra"`
+}
+
+type playURLV1Response struct {
+	Code int `json:"code"`
+	Data struct {
+		CurrentQn int `json:"current_qn"`
+		Durl      []struct {
+			URL   string `json:"url"`
+			Order int    `json:"order"`
+		} `json:"durl"`
+	} `json:"data"`
 }

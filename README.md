@@ -1,40 +1,98 @@
 # Live Stream Forwarder
-## Overview
-Live Stream Forwarder (formly streamlink-go) is a tool that converts website live streams into local live broadcast services for video players (e.g. VLC or PotPlayer) directly access.
-## Supported Live Streaming Platform
-| Platform                                         | URL token |
-|--------------------------------------------------|-----------|
-| [Douyu](https://www.douyu.com "douyu.com")       | douyu     |
-| [Huya](https://www.huya.com "huya.com")          | huya      |
-| [Twitch](https://twitch.tv "Twitch")             | twitch    |
-| [Bilibili](https://live.bilibili.com "BiliBili") | bilibili  |
-| [Douyin](https://live.douyin.com "Douyin")       | douyin    |
-## Installing
-Just download at [releases](https://github.com/nv4d1k/live-stream-forwarder/releases "releases") page and decompressing it to anywhere you wanted.
+
+Live Stream Forwarder (`lsf`) converts live streams from various platforms into locally accessible streams for video players (VLC, PotPlayer, etc.). It acts as a transparent proxy — no re-encoding, no transcoding.
+
+## Supported Platforms
+
+| Platform | URL Token | Example |
+|----------|-----------|---------|
+| [DouYu](https://www.douyu.com) | `douyu` | `http://localhost:8080/douyu/12345` |
+| [HuYa](https://www.huya.com) | `huya` | `http://localhost:8080/huya/12345` |
+| [BiliBili](https://live.bilibili.com) | `bilibili` | `http://localhost:8080/bilibili/12345` |
+| [DouYin](https://live.douyin.com) | `douyin` | `http://localhost:8080/douyin/12345` |
+| [Twitch](https://www.twitch.tv) | `twitch` | `http://localhost:8080/twitch/eslcs` |
+
+## Install
+
+Download the latest release from the [releases page](https://github.com/nv4d1k/live-stream-forwarder/releases).
+
+### Docker
+
+```bash
+docker build --build-arg VERSION=x.x.x --build-arg BUILD_TIME="$(date)" --build-arg SHA="$(git rev-parse HEAD)" -t lsf .
+```
+
+### Build from source
+
+```bash
+go build -o lsf .
+```
+
 ## Usage
-Start the service listening on ip address 127.0.0.1 and a random port by default. e.g.
 
-    lsf
-Start. the service listening on specified address or port. e.g.
+### Start the service
 
-    lsf -l <address> -p <port>
-or
+```bash
+# Default: listen on 127.0.0.1 with a random port
+lsf
 
-    lsf --listen-address <address> --listen-port <port>
-Start the service with debug mode. e.g.
+# Specify address and port
+lsf -l 0.0.0.0 -p 8080
 
-    lsf --log-level 6
-Start the service with storing logs on file. e.g.
+# With HTTP proxy
+lsf --proxy http://user:pass@host:port
 
-    lsf --log-file example.log
-Start the service with http proxy. e.g.
+# Debug mode (enables /debug/* endpoints including pprof)
+lsf --log-level 6
 
-    lsf --proxy http://<username>:<password>@<address>:<port>
-Open the stream on video player. e.g.
+# Log to file
+lsf --log-file lsf.log
+```
 
-    http://<address>:<port>/<platform url token>/<room id>
-Open the stream on video player with http proxy. e.g.
+### Open stream in player
 
-    http://<address>:<port>/<platform url token>/<room id>?proxy=http://<username>:<password>@<address>:<port>
+```
+http://<address>:<port>/<platform>/<room_id>
+```
+
+For example, to watch DouYu room 12345:
+
+```
+http://127.0.0.1:8080/douyu/12345
+```
+
+### Per-request proxy
+
+```
+http://<address>:<port>/<platform>/<room_id>?proxy=http://user:pass@host:port
+```
+
+### Format selection
+
+Some platforms support multiple stream formats. Use the `?format=` query parameter:
+
+```
+http://<address>:<port>/huya/12345?format=flv
+http://<address>:<port>/huya/12345?format=hls
+```
+
+Available formats by platform:
+
+| Platform | Formats | Default |
+|----------|---------|---------|
+| DouYu | flv, m3u8, ws | flv |
+| HuYa | flv, hls | flv |
+| BiliBili | flv, m3u8 | flv |
+| DouYin | flv, m3u8 | flv |
+| Twitch | m3u8 | m3u8 |
+
+## Features
+
+- **Seamless 403 recovery**: When an upstream stream URL expires (HTTP 403), the forwarder automatically re-extracts a fresh URL and reconnects — the player never sees a break.
+- **Best quality by default**: HLS streams automatically select the highest bandwidth variant. BiliBili uses the v1 API first for higher quality before falling back to v2.
+- **FLV header caching**: Late-joining clients receive a cached FLV header before live data, enabling mid-stream connections without player errors.
+- **No re-encoding**: Streams are forwarded as-is, keeping latency minimal.
+
 ## License
-See [LICENSE.txt](LICENSE.txt)
+
+[MIT](LICENSE.txt)
