@@ -11,10 +11,21 @@ import (
 	"strings"
 
 	"github.com/antchfx/htmlquery"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/tidwall/gjson"
 )
+
+func init() {
+	extractor.Register("douyin", extractor.RegistryEntry{
+		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
+			return NewDouYinLink(rid, proxy)
+		},
+		Mobile:       false,
+		InitialError: 500,
+	})
+}
 
 var QIALITIES = []string{"origin", "hd", "sd", "ld", "md"}
 
@@ -77,6 +88,25 @@ func (l *Link) getCookies() error {
 		return errors.New("both __ac_nonce and ttwid are not found")
 	}
 	return nil
+}
+
+func (l *Link) Extract(format string) (*extractor.Result, error) {
+	if format == "" {
+		format = l.DefaultFormat()
+	}
+	u, err := l.GetLink(format)
+	if err != nil {
+		return nil, err
+	}
+	return &extractor.Result{URL: u.String()}, nil
+}
+
+func (l *Link) SupportedFormats() []string {
+	return []string{"flv", "m3u8"}
+}
+
+func (l *Link) DefaultFormat() string {
+	return "flv"
 }
 
 func (l *Link) GetLink(format string) (*url.URL, error) {

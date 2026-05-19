@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 
@@ -24,6 +25,16 @@ import (
 	uuidgen "github.com/satori/go.uuid"
 	"github.com/tidwall/gjson"
 )
+
+func init() {
+	extractor.Register("douyu", extractor.RegistryEntry{
+		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
+			return NewDouyuLink(rid, proxy)
+		},
+		Mobile:       false,
+		InitialError: 400,
+	})
+}
 
 type Link struct {
 	rid          string
@@ -74,6 +85,22 @@ func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 		return nil, fmt.Errorf("get encrypt data error: %w", err)
 	}
 	return dy, nil
+}
+
+func (l *Link) Extract(format string) (*extractor.Result, error) {
+	u, err := l.GetLink(format)
+	if err != nil {
+		return nil, err
+	}
+	return &extractor.Result{URL: u.String()}, nil
+}
+
+func (l *Link) SupportedFormats() []string {
+	return []string{"flv", "m3u8", "ws"}
+}
+
+func (l *Link) DefaultFormat() string {
+	return "flv"
 }
 
 // GetLink returns a stream URL. The format parameter is accepted for
