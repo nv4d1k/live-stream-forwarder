@@ -37,12 +37,20 @@ Live Stream Forwarder (`lsf`) converts live streams from Chinese and internation
 ### Two-layer engine under `app/engine/`
 
 **Extractors** (`app/engine/extractor/<Platform>/`) — resolve a room ID to a stream URL:
-- Each has a `Link` struct with `New<Platform>Link(rid, proxy)` and `GetLink()` returning `*url.URL`
-- DouYu: MD5 auth chain, encryption data, supports p2p (ws/wss) via `p2p` field (0/2/9/10)
-- HuYa: goja JS VM to parse `HNF_GLOBAL_INIT` from page HTML, anti-code processing; `GetLink(format)` accepts `?format=flv|hls`
-- BiliBili: two API versions (v1 fallback to v2), Referer header required
-- DouYin: cookie auth (`__ac_nonce`/`ttwid`), extracts JSON from `self.__pace_f.push` in `<script>` tags
-- Twitch: GraphQL token/sig exchange, client ID scraped from page
+
+All extractors implement the unified `Extractor` interface (`app/engine/extractor/extractor.go`):
+- `Extract(format) (*Result, error)` — returns URL + required headers
+- `SupportedFormats() []string` — e.g. `["flv", "m3u8"]`
+- `DefaultFormat() string` — fallback when caller doesn't specify
+
+Each platform registers itself via `init()` calling `extractor.Register(name, RegistryEntry)` with a `Factory`, `Mobile` flag, and `InitialError` HTTP status code. The controller looks up platforms by name from `extractor.Registry` — no per-platform switch-case.
+
+Platform specifics:
+- **DouYu**: MD5 auth chain, encryption data, supports p2p (ws/wss) via `p2p` field (0/2/9/10); `SupportedFormats: ["flv", "m3u8", "ws"]`
+- **HuYa**: goja JS VM to parse `HNF_GLOBAL_INIT` from page HTML, anti-code processing; `GetLink(format)` accepts `flv`/`hls`; `m3u8` is normalized to `hls` internally
+- **BiliBili**: v1 API (`/room/v1/Room/playUrl`) tried first for higher quality (returns qn=10000 for unauthenticated users), falls back to v2 API (`getRoomPlayInfo`) which may degrade quality; `Mobile: false`; Referer header required
+- **DouYin**: cookie auth (`__ac_nonce`/`ttwid`), extracts JSON from `self.__pace_f.push` in `<script>` tags
+- **Twitch**: hardcoded public Client-ID (`kimne78kx3ncx6brgo4mv6wki5h1ko`), GraphQL `PlaybackAccessToken_Template` for sig+token, Usher HLS master playlist; `SupportedFormats: ["m3u8"]`
 
 **Forwarders** (`app/engine/forwarder/<type>/`) — pipe stream data from upstream to client:
 
@@ -50,24 +58,29 @@ All forwarders use a **Pipe-based architecture** for seamless 403 recovery. When
 
 - `stream/` — shared `Pipe` (goroutine-safe buffered io.Reader/io.Writer) and `Stream` (producer goroutine with infinite 403 retry loop). `ExtractFunc` signature is `func(previous *ExtractResult) (*ExtractResult, error)` — receives the previous result on retries so format consistency (scheme + path extension) can be validated via `formatMatches()`. Retries are unlimited; only stops on client disconnect or non-retriable errors.
 - `httpweb/` — `Stream(extractFn)` returns `*stream.Stream` for HTTP/FLV; `Forward()` kept for backward compat. `AddHeaderTransport` injects User-Agent (desktop or mobile).
-- `hls/` — `StreamSegment(extractFn)` for non-m3u8 segment data via pipe. Playlist methods (`ForwardM3u8`, `WrapPlaylist`) remain direct — playlists are short-lived, not piped. All segment/variant URLs are rewritten to self-referencing URLs with original URL base64-encoded in `?url=` param.
+- `flv/` — `FLVStream` wraps a `*stream.Stream` and prepends cached FLV header for mid-stream client connections. `HeaderCache` is keyed by `"platform:room"`, process-wide via `DefaultCache`. `HeaderCacheWriter` captures the first bytes of the stream as the FLV header.
+- `hls/` — `HLSStream` has its own produce loop: fetches/parse m3u8, downloads segments, pipes raw MPEG-TS. Master playlist variant selection picks **highest BANDWIDTH** (`pickHighestBandwidthVariant`). 403 on any playlist/segment clears `mediaPlaylistURL` and re-extracts.
 - `websocket/` — `WebSocketForwarderWithRetry(extractFn)` uses `XP2PClientWithRetry` which validates re-extracted URLs are still ws/wss and reconnects within `ReadLoop`.
 
 ### HTTP layer
 
 - `cmd/root.go` — Cobra CLI, sets up Gin router with CORS and proxy middleware. Single route: `GET /:platform/:room`
-- `controllers/forwarder.go` — dispatches by platform name, creates `ExtractFunc` closures with format consistency checks, selects forwarder by URL scheme/extension. Segment requests (`?url=` param) return 302 redirect to main room URL on 403, causing player to re-fetch playlist through the pipe-based path.
+- `controllers/forwarder.go` — registry-based dispatch: looks up platform in `extractor.Registry`, creates extractor, builds `ExtractFunc` closure with format consistency checks, dispatches to forwarder by URL scheme/extension via `dispatchStream()`. Format resolution: `?format=` query param → extractor's `SupportedFormats()` → random pick between flv/m3u8 if both available → `DefaultFormat()`.
 
 ### Request flow
 
 ```
 GET /douyu/12345
-  → controller creates extractFn closure
-  → extractFn(nil) → first extraction → determine scheme
-  → scheme http/https → httpweb.Stream(extractFn) → streamToClient()
-  → scheme ws/wss → websocket.ForwarderWithRetry(extractFn).Start()
+  → controller: extractor.Registry["douyu"].Factory("12345", proxy)
+  → ext.Extract(desiredFormat) → *Result{URL, Headers}
+  → extractFn closure wraps ext.Extract with format consistency checks
+  → extractFn(nil) → first extraction → determine initialFormat
+  → dispatchStream by scheme/extension:
+      http(s) + .flv  → flvStreamWithCache → streamToClient (video/x-flv)
+      http(s) + .m3u8 → hls.Stream → streamToClient (video/mp2t)
+      ws(s)           → websocket.ForwarderWithRetry
 
-  Producer goroutine inside Stream:
+  Producer goroutine (inside Stream or HLSStream):
     extractFn(previous) → fetch → io.Copy into Pipe
     on 403 → extractFn(previous) again → reconnect → continue
     on client disconnect → Pipe.BreakWithError → stop
@@ -81,7 +94,9 @@ GET /douyu/12345
 
 ## Key patterns
 
-- HLS URL rewriting: m3u8 playlists have all URLs rewritten to route back through the service itself (`prefix` URL), with the original URL base64-encoded in `?url=`. This allows proxying each segment individually.
-- Proxy threading: CLI `--proxy` flag or per-request `?proxy=` query param → Gin middleware sets in context → passed through extractors and forwarders.
-- Format consistency on retry: `ExtractFunc(previous)` receives the previous result on retry. The controller and `Stream.produce()` both validate that re-extracted URLs have the same scheme and path extension (e.g. won't switch from FLV to m3u8 mid-stream).
-- Gin version is pinned to 1.11.0 (downgraded due to nil pointer issue in Docker containers).
+- **Extractor registry**: Platforms self-register via `init()`. Adding a new platform requires: (1) implement `Extractor` interface, (2) call `extractor.Register()` in `init()`, (3) add blank import in `controllers/forwarder.go`. No controller changes needed.
+- **HLS variant selection**: `pickHighestBandwidthVariant` in `hls/hlsstream.go` always selects the highest bandwidth variant from master playlists, giving the best quality across all HLS platforms.
+- **FLV header caching**: `flv.DefaultCache` stores the FLV header per `"platform:room"` key so late-joining clients receive the header before live data, enabling mid-stream connection without player errors.
+- **Format consistency on retry**: `ExtractFunc(previous)` receives the previous result on retry. The controller and `Stream.produce()` both validate that re-extracted URLs have the same scheme and path extension (e.g. won't switch from FLV to m3u8 mid-stream).
+- **Proxy threading**: CLI `--proxy` flag or per-request `?proxy=` query param → Gin middleware sets in context → passed through extractors and forwarders.
+- **Gin version is pinned to 1.11.0** (downgraded due to nil pointer issue in Docker containers).
