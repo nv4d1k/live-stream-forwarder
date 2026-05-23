@@ -27,6 +27,8 @@ type HLSStream struct {
 }
 
 func NewHLSStream(extractFn stream.ExtractFunc, hc *http.Client) *HLSStream {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.NewHLSStream")
+	log.Debug("creating HLSStream")
 	s := &HLSStream{
 		pipe:      stream.NewPipe(),
 		done:      make(chan struct{}),
@@ -42,6 +44,8 @@ func (s *HLSStream) Read(p []byte) (int, error) {
 }
 
 func (s *HLSStream) Close() error {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.HLSStream.Close")
+	log.Debug("closing HLSStream")
 	s.closeOnce.Do(func() {
 		s.pipe.BreakWithError(io.ErrClosedPipe)
 		close(s.done)
@@ -55,6 +59,8 @@ func (s *HLSStream) Wait() error {
 }
 
 func (s *HLSStream) closeWithError(err error) {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.HLSStream.closeWithError")
+	log.Warnf("closing HLSStream with error: %s", err.Error())
 	s.closeErr = err
 	s.pipe.CloseWithError(err)
 	s.closeOnce.Do(func() {
@@ -63,7 +69,7 @@ func (s *HLSStream) closeWithError(err error) {
 }
 
 func (s *HLSStream) produce() {
-	log := global.Log.WithField("function", "app.engine.forwarder.hls.HLSStream.produce")
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.HLSStream.produce")
 
 	var previous *stream.ExtractResult
 	var mediaPlaylistURL string
@@ -196,25 +202,34 @@ func (s *HLSStream) produce() {
 }
 
 func (s *HLSStream) fetchAndPipeSegment(segURL string, headers http.Header) error {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.HLSStream.fetchAndPipeSegment")
 	resp, err := doRequestWithHeaders(s.hc, "GET", segURL, headers)
 	if err != nil {
+		log.Warnf("fetch segment error: %s", err.Error())
 		return fmt.Errorf("fetch segment error: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		log.Warnf("fetch segment got status: %s", resp.Status)
 		return fmt.Errorf("fetch segment err got: %s", resp.Status)
 	}
 	_, err = io.Copy(s.pipe, resp.Body)
+	if err != nil {
+		log.Warnf("pipe segment data error: %s", err.Error())
+	}
 	return err
 }
 
 func fetchAndParseM3U8(hc *http.Client, m3u8URL string, headers http.Header) (libm3u8.Playlist, libm3u8.ListType, error) {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.fetchAndParseM3U8")
 	resp, err := doRequestWithHeaders(hc, "GET", m3u8URL, headers)
 	if err != nil {
+		log.Warnf("get m3u8 file error: %s", err.Error())
 		return nil, 0, fmt.Errorf("get m3u8 file error: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		log.Warnf("get m3u8 got status: %s", resp.Status)
 		return nil, 0, fmt.Errorf("get m3u8 err got: %s", resp.Status)
 	}
 	return libm3u8.DecodeFrom(resp.Body, true)
@@ -251,11 +266,13 @@ func isRetriableHLS(err error) bool {
 }
 
 func pickHighestBandwidthVariant(variants []*libm3u8.Variant) *libm3u8.Variant {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.pickHighestBandwidthVariant")
 	best := variants[0]
 	for _, v := range variants[1:] {
 		if v.Bandwidth > best.Bandwidth {
 			best = v
 		}
 	}
+	log.Debugf("selected variant bandwidth=%d uri=%s", best.Bandwidth, best.URI)
 	return best
 }

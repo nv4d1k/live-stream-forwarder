@@ -21,6 +21,8 @@ func (adt *AddHeaderTransport) RoundTrip(req *http.Request) (*http.Response, err
 }
 
 func NewAddHeaderTransport(T http.RoundTripper, mobile bool) *AddHeaderTransport {
+	log := global.Log.WithField("func", "app.engine.forwarder.httpweb.NewAddHeaderTransport")
+	log.Debugln("creating AddHeaderTransport")
 	if T == nil {
 		T = http.DefaultTransport
 	}

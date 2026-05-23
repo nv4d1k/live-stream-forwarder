@@ -93,6 +93,10 @@ Available formats by platform:
 - **FLV header caching**: Late-joining clients receive a cached FLV header before live data, enabling mid-stream connections without player errors.
 - **No re-encoding**: Streams are forwarded as-is, keeping latency minimal.
 
+## Development
+
+- [Writing a Custom Extractor](docs/writing-extractor.md)
+
 ## License
 
 [MIT](LICENSE.txt)

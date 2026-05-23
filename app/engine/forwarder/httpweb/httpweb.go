@@ -17,6 +17,8 @@ type HTTPWebForwarder struct {
 }
 
 func NewHTTPWebForwarder(proxy *url.URL, mobile bool) *HTTPWebForwarder {
+	log := global.Log.WithField("func", "app.engine.forwarder.httpweb.NewHTTPWebForwarder")
+	log.Debugln("creating HTTPWebForwarder")
 	h := new(HTTPWebForwarder)
 	h.Client = &http.Client{}
 	h.Client.Transport = NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, mobile)
@@ -27,12 +29,14 @@ func NewHTTPWebForwarder(proxy *url.URL, mobile bool) *HTTPWebForwarder {
 // the upstream. When a 403 is encountered, extractFn is called to get a fresh URL.
 // opts can be used to configure the stream (e.g. WithWriterWrapper for FLV header caching).
 func (h *HTTPWebForwarder) Stream(extractFn stream.ExtractFunc, opts ...stream.StreamOption) *stream.Stream {
+	log := global.Log.WithField("func", "app.engine.forwarder.httpweb.Stream")
+	log.Debugln("creating stream")
 	return stream.NewStream(extractFn, h.fetch, opts...)
 }
 
 // fetch makes a GET request and returns the response body.
 func (h *HTTPWebForwarder) fetch(u string, headers http.Header) (io.ReadCloser, error) {
-	log := global.Log.WithField("function", "app.engine.forwarder.httpweb.fetch")
+	log := global.Log.WithField("func", "app.engine.forwarder.httpweb.fetch")
 	log.WithField("field", "backend url").Debug(u)
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
@@ -66,7 +70,7 @@ func (h *HTTPWebForwarder) fetch(u string, headers http.Header) (io.ReadCloser, 
 }
 
 func (h *HTTPWebForwarder) Forward(ctx *gin.Context, headers http.Header, u string, depth int) error {
-	log := global.Log.WithField("function", "app.engine.forwarder.httpweb.HTTPWebForwarder.Forward")
+	log := global.Log.WithField("func", "app.engine.forwarder.httpweb.HTTPWebForwarder.Forward")
 	log.WithField("field", "backend url").Debug(u)
 	if depth > 10 {
 		return errors.New("too many redirections")

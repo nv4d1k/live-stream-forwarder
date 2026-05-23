@@ -18,6 +18,8 @@ import (
 )
 
 func NewXP2PClient(u string, header http.Header, proxy *url.URL) Background {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewXP2PClient")
+	log.WithField("url", u).Debug("creating XP2PClient")
 	c := &client{
 		url:    u,
 		header: header,
@@ -62,6 +64,8 @@ func NewXP2PClient(u string, header http.Header, proxy *url.URL) Background {
 // from extractFn when the connection fails with a retriable error (e.g. 403).
 // cacheKey enables FLV header caching; empty string disables it.
 func NewXP2PClientWithRetry(extractFn stream.ExtractFunc, header http.Header, proxy *url.URL, cacheKey string) Background {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewXP2PClientWithRetry")
+	log.WithField("cacheKey", cacheKey).Debug("creating XP2PClientWithRetry")
 	c := &client{
 		header: header,
 		dialer: &ws.Dialer{
@@ -118,7 +122,7 @@ type client struct {
 }
 
 func (c *client) Start() error {
-	log := global.Log.WithField("function", "app.engine.forwarder.websocket.client.Start")
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.Start")
 	if c.extractFn != nil {
 		result, err := c.extractFn(c.previous)
 		if err != nil {
@@ -141,37 +145,44 @@ func (c *client) Start() error {
 }
 
 func (c *client) DialContext(ctx context.Context) error {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.DialContext")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	conn, resp, err := c.dialer.DialContext(ctx, c.url, c.header)
 	if err != nil {
 		if resp != nil && resp.StatusCode == 403 {
+			log.WithField("url", c.url).Warnf("dial forbidden: %s", resp.Status)
 			return fmt.Errorf("err got: %s", resp.Status)
 		}
+		log.WithField("url", c.url).Warnf("dial error: %s", err.Error())
 		return err
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		log.WithField("url", c.url).Warnf("unexpected status: %s", resp.Status)
 		return fmt.Errorf("dial err: %s", resp.Status)
 	}
 
 	c.conn = conn
+	log.WithField("url", c.url).Debug("dial succeeded")
 	return nil
 }
 
 func (c *client) Close() error {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.Close")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn == nil {
 		return nil
 	}
+	log.Debug("closing connection")
 	err := c.conn.Close()
 	c.conn = nil
 	return err
 }
 
 func (c *client) ReadLoop() {
-	log := global.Log.WithField("function", "app.engine.forwarder.websocket.client.ReadLoop")
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.ReadLoop")
 	for {
 		mt, body, err := c.conn.ReadMessage()
 		if err != nil {

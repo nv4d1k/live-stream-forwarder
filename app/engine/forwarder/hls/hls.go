@@ -6,6 +6,7 @@ import (
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
+	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
 type HLSForwarder struct {
@@ -15,6 +16,8 @@ type HLSForwarder struct {
 }
 
 func NewHLSForwarder(proxy *url.URL, mobile bool) *HLSForwarder {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.NewHLSForwarder")
+	log.Debugf("creating HLSForwarder proxy=%v mobile=%v", proxy, mobile)
 	h := &HLSForwarder{
 		proxy:  proxy,
 		hc:     &http.Client{},
@@ -31,5 +34,7 @@ func NewHLSForwarder(proxy *url.URL, mobile bool) *HLSForwarder {
 // Stream returns an *HLSStream that continuously fetches the HLS playlist,
 // downloads segments, and pipes raw MPEG-TS data to the client.
 func (h *HLSForwarder) Stream(extractFn stream.ExtractFunc) *HLSStream {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.HLSForwarder.Stream")
+	log.Debug("creating HLSStream from extractFn")
 	return NewHLSStream(extractFn, h.hc)
 }

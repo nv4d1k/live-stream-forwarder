@@ -111,7 +111,7 @@ func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, pr
 		f := websocket.NewWebSocketForwarderWithRetry(proxyURL, mobile, extractFn, key)
 		err := f.Start(c, u.String())
 		if err != nil {
-			global.Log.WithField("function", "app.http.controllers.dispatchStream").
+			global.Log.WithField("func", "app.http.controllers.dispatchStream").
 				Errorf("forward ws(s) stream error: %s\n", err.Error())
 		}
 	default:
@@ -129,7 +129,7 @@ func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, pr
 }
 
 func Forwarder(c *gin.Context) {
-	log := global.Log.WithField("function", "app.http.controllers.Forwarder")
+	log := global.Log.WithField("func", "app.http.controllers.Forwarder")
 	log.WithField("http request", "headers").Debug(c.Request.Header)
 	proxy := c.GetString("proxy")
 	format := c.DefaultQuery("format", "")

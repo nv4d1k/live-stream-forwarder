@@ -26,9 +26,22 @@ go test -cover -v ./...
 # Run single package tests
 go test -cover -v ./app/engine/extractor/DouYu/...
 
-# Docker build
+# Format
+gofmt -w .
+
+# Docker build (multi-arch image: nv4d1k/live-stream-forwarder)
 docker build --build-arg VERSION=x.x.x --build-arg BUILD_TIME="$(date)" --build-arg SHA="$(git rev-parse HEAD)" .
 ```
+
+### CLI flags and env vars
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `-l, --listen-address` | `LISTEN_ADDR` | `127.0.0.1` | Bind address |
+| `-p, --listen-port` | `LISTEN_PORT` | `0` (random) | Bind port |
+| `--proxy` | — | — | Global HTTP proxy URL |
+| `--log-level` | — | `3` (warn) | 0–6; 6 = debug, enables `/debug/*` endpoints |
+| `--log-file` | — | stdout | Log file path (also outputs to stdout) |
 
 ## Architecture
 
@@ -65,7 +78,8 @@ All forwarders use a **Pipe-based architecture** for seamless 403 recovery. When
 ### HTTP layer
 
 - `cmd/root.go` — Cobra CLI, sets up Gin router with CORS and proxy middleware. Single route: `GET /:platform/:room`
-- `controllers/forwarder.go` — registry-based dispatch: looks up platform in `extractor.Registry`, creates extractor, builds `ExtractFunc` closure with format consistency checks, dispatches to forwarder by URL scheme/extension via `dispatchStream()`. Format resolution: `?format=` query param → extractor's `SupportedFormats()` → random pick between flv/m3u8 if both available → `DefaultFormat()`.
+- `controllers/forwarder.go` — registry-based dispatch: looks up platform in `extractor.Registry`, creates extractor, builds `ExtractFunc` closure with format consistency checks, dispatches to forwarder by URL scheme/extension via `dispatchStream()`. Format resolution: `?format=` query param → extractor's `SupportedFormats()` → random pick between flv/m3u8 if both available → `DefaultFormat()`. Per-request `?proxy=` overrides the global `--proxy` flag.
+- `controllers/debug.go` — pprof and debug endpoints, only registered when `--log-level 6`
 
 ### Request flow
 
@@ -100,3 +114,7 @@ GET /douyu/12345
 - **Format consistency on retry**: `ExtractFunc(previous)` receives the previous result on retry. The controller and `Stream.produce()` both validate that re-extracted URLs have the same scheme and path extension (e.g. won't switch from FLV to m3u8 mid-stream).
 - **Proxy threading**: CLI `--proxy` flag or per-request `?proxy=` query param → Gin middleware sets in context → passed through extractors and forwarders.
 - **Gin version is pinned to 1.11.0** (downgraded due to nil pointer issue in Docker containers).
+- **403 retry detection**: `isRetriable()` in `stream/stream.go` checks for "403" substring in error messages — this is string-based, not status-code-based.
+- **`.xs` extension**: `dispatchStream` treats `.xs` the same as `.flv` (both route to FLV forwarder).
+- **HuYa format normalization**: HuYa normalizes `m3u8` to `hls` internally; the controller uses the raw format string from the extractor.
+- **CI/CD**: Docker builds produce multi-arch images (linux/386, amd64, arm/v6, arm/v7, arm64, ppc64le, riscv64, s390x). Release workflow builds for linux/windows/darwin × amd64/arm64.

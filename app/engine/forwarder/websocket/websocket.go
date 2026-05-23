@@ -21,6 +21,8 @@ type WebSocketForwarder struct {
 }
 
 func NewWebSocketForwarder(proxy *url.URL, mobile bool) Foreground {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewWebSocketForwarder")
+	log.WithField("mobile", mobile).Debug("creating WebSocketForwarder")
 	return &WebSocketForwarder{
 		stopCh: make(chan struct{}),
 		proxy:  proxy,
@@ -32,6 +34,8 @@ func NewWebSocketForwarder(proxy *url.URL, mobile bool) Foreground {
 // using extractFn when the upstream connection fails with a retriable error.
 // cacheKey enables FLV header caching; empty string disables it.
 func NewWebSocketForwarderWithRetry(proxy *url.URL, mobile bool, extractFn stream.ExtractFunc, cacheKey string) Foreground {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewWebSocketForwarderWithRetry")
+	log.WithField("mobile", mobile).WithField("cacheKey", cacheKey).Debug("creating WebSocketForwarderWithRetry")
 	return &WebSocketForwarder{
 		stopCh:    make(chan struct{}),
 		proxy:     proxy,
@@ -51,7 +55,7 @@ func (s *WebSocketForwarder) httpHeader() http.Header {
 }
 
 func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
-	log := global.Log.WithField("function", "app.engine.forwarder.websocket.WebSocketForwarder.Start")
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.WebSocketForwarder.Start")
 	log.WithField("field", "backend url").Debug(u)
 	ux, err := url.Parse(u)
 	if err != nil {

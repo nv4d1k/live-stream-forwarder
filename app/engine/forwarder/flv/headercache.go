@@ -1,6 +1,10 @@
 package flv
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/nv4d1k/live-stream-forwarder/global"
+)
 
 // HeaderCache stores cached FLV headers keyed by "platform:room".
 type HeaderCache struct {
@@ -20,6 +24,8 @@ type HeaderEntry struct {
 var DefaultCache = NewHeaderCache()
 
 func NewHeaderCache() *HeaderCache {
+	log := global.Log.WithField("func", "app.engine.forwarder.flv.NewHeaderCache")
+	log.Debug("creating HeaderCache")
 	return &HeaderCache{
 		entries: make(map[string]*HeaderEntry),
 	}
@@ -27,6 +33,7 @@ func NewHeaderCache() *HeaderCache {
 
 // GetOrCreate returns the existing HeaderEntry for key, or creates a new one.
 func (c *HeaderCache) GetOrCreate(key string) *HeaderEntry {
+	log := global.Log.WithField("func", "app.engine.forwarder.flv.GetOrCreate")
 	c.mu.RLock()
 	e, ok := c.entries[key]
 	c.mu.RUnlock()
@@ -42,6 +49,7 @@ func (c *HeaderCache) GetOrCreate(key string) *HeaderEntry {
 	}
 	e = newHeaderEntry()
 	c.entries[key] = e
+	log.WithField("key", key).Debug("created new header cache entry")
 	return e
 }
 
@@ -55,6 +63,7 @@ func newHeaderEntry() *HeaderEntry {
 // May be called multiple times (on 403 reconnect with a fresh stream);
 // each call updates the cached data.
 func (e *HeaderEntry) Set(data []byte) {
+	log := global.Log.WithField("func", "app.engine.forwarder.flv.Set")
 	copied := make([]byte, len(data))
 	copy(copied, data)
 
@@ -63,6 +72,7 @@ func (e *HeaderEntry) Set(data []byte) {
 	e.mu.Unlock()
 
 	e.once.Do(func() { close(e.ready) })
+	log.WithField("size", len(data)).Debug("cached FLV header")
 }
 
 // Wait blocks until the header data is available (Set has been called at least once).

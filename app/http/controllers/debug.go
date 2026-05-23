@@ -21,7 +21,7 @@ func Debug(r *gin.RouterGroup) {
 	r.GET("/pprof/profile", func(ctx *gin.Context) { pprof.Profile(ctx.Writer, ctx.Request) })
 	r.GET("/pprof/cmdline", func(ctx *gin.Context) { pprof.Cmdline(ctx.Writer, ctx.Request) })
 	r.GET("/:method", func(c *gin.Context) {
-		log := global.Log.WithField("function", "app.http.controllers.Debug")
+		log := global.Log.WithField("func", "app.http.controllers.Debug")
 		proxy := c.GetString("proxy")
 		var proxyURL *url.URL
 		var err error

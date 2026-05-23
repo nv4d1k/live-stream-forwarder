@@ -1,30 +1,21 @@
 package HuYa
 
 import (
-	"crypto/md5"
-	"encoding/base64"
-	"encoding/hex"
-	"errors"
 	"fmt"
-	"io"
-	"math/rand"
 	"net/http"
 	"net/url"
-	"regexp"
-	"slices"
-	"strconv"
-	"strings"
-	"time"
 
-	"github.com/dop251/goja"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
-	"github.com/nv4d1k/live-stream-forwarder/global"
-
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
+	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/tidwall/gjson"
 )
 
 func init() {
+	if global.Log != nil {
+		log := global.Log.WithField("func", "app.engine.extractor.HuYa.init")
+		log.Infoln("registering extractor")
+	}
 	extractor.Register("huya", extractor.RegistryEntry{
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewHuyaLink(rid, proxy)
@@ -44,11 +35,13 @@ type Link struct {
 }
 
 func NewHuyaLink(rid string, proxy *url.URL) (*Link, error) {
+	log := global.Log.WithField("func", "app.engine.extractor.HuYa.NewHuyaLink")
 	var (
 		err error
 	)
 	hy := new(Link)
 	hy.rid = rid
+	log.WithField("rid", rid).Infoln("creating HuYa extractor")
 	if proxy != nil {
 		hy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, true)}
 	} else {
@@ -56,28 +49,35 @@ func NewHuyaLink(rid string, proxy *url.URL) (*Link, error) {
 	}
 	err = hy.getRoomInfo()
 	if err != nil {
+		log.WithError(err).Errorln("failed to get room info")
 		return nil, fmt.Errorf("get room info error: %w", err)
 	}
 	err = hy.getAnonymousUID()
 	if err != nil {
+		log.WithError(err).Errorln("failed to get anonymous user id")
 		return nil, fmt.Errorf("get anonymous user id error: %w", err)
 	}
 	hy.getUUID()
+	log.Infoln("HuYa extractor created successfully")
 	return hy, nil
 }
 
 func (l *Link) Extract(format string) (*extractor.Result, error) {
+	log := global.Log.WithField("func", "app.engine.extractor.HuYa.Extract")
 	if format == "" {
 		format = l.DefaultFormat()
 	}
 	// Normalize "m3u8" to "hls" for HuYa's internal API.
 	if format == "m3u8" {
+		log.Debugln("normalizing format from m3u8 to hls")
 		format = "hls"
 	}
 	u, err := l.GetLink(format)
 	if err != nil {
+		log.WithError(err).Errorln("failed to get stream link")
 		return nil, err
 	}
+	log.WithField("url", u.String()).Infoln("extracted stream URL")
 	return &extractor.Result{URL: u.String()}, nil
 }
 
@@ -87,238 +87,4 @@ func (l *Link) SupportedFormats() []string {
 
 func (l *Link) DefaultFormat() string {
 	return "flv"
-}
-
-func (l *Link) GetLink(format string) (*url.URL, error) {
-	switch l.res.Get("roomInfo.eLiveStatus").Int() {
-	case 2:
-		liveInfo, err := l.getLive(format)
-		if err != nil {
-			return nil, fmt.Errorf("get live info error: %w", err)
-		}
-		return url.Parse(liveInfo)
-	case 3:
-		liveLineURL, err := base64.StdEncoding.DecodeString(l.res.Get("roomProfile.liveLineUrl").String())
-		if err != nil {
-			return nil, fmt.Errorf("decoding live line url error: %w", err)
-		}
-		return url.Parse(fmt.Sprintf("https:%s", liveLineURL))
-	}
-	return nil, errors.New("not streaming now")
-}
-
-func (l *Link) getAnonymousUID() (err error) {
-	log := global.Log.WithField("function", "app.engine.extractor.HuYa.getAnonymousUID")
-	var (
-		resp *http.Response
-		body []byte
-	)
-	data := `{
-        "appId": 5002,
-        "byPass": 3,
-        "context": "",
-        "version": "2.4",
-        "data": {}
-    }`
-	resp, err = l.client.Post("https://udblgn.huya.com/web/anonymousLogin", "application/json", strings.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("sending get anonymous uid request error: %w", err)
-	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			log.Fatalln(err.Error())
-		}
-	}(resp.Body)
-	body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("parsing get anonymous uid response body error: %w", err)
-	}
-	log.WithField("field", "anonymous uid response body").Debug(string(body))
-	if !gjson.GetBytes(body, "data.uid").Exists() {
-		return errors.New("anonymous user id not found")
-	}
-	l.uid = gjson.GetBytes(body, "data.uid").String()
-	l.uidi = gjson.GetBytes(body, "data.uid").Int()
-	return nil
-}
-
-func (l *Link) getLive(format string) (string, error) {
-	log := global.Log.WithField("function", "app.engine.extractor.HuYa.getLive")
-	var (
-		stream_info     []string
-		flv_stream_info []string
-		hls_stream_info []string
-	)
-	l.res.Get("roomInfo.tLiveInfo.tLiveStreamInfo.vStreamInfo.value").ForEach(func(key, value gjson.Result) bool {
-		/*if value.Get("sHlsUrl").Exists() {
-			anticode, err := l.processAntiCode(value.Get("sHlsAntiCode").String(), value.Get("sStreamName").String())
-			if err != nil {
-				log.Println(fmt.Sprintf("processing anticode error: %s", err.Error()))
-				return false
-			}
-			u, err := url.Parse(fmt.Sprintf("%s/%s.%s?%s",
-				value.Get("sHlsUrl").String(),
-				value.Get("sStreamName").String(),
-				value.Get("sHlsUrlSuffix").String(),
-				anticode))
-			if err != nil {
-				log.Println(err.Error())
-				return false
-			}
-			u.Scheme = "https"
-			hls_stream_info = append(hls_stream_info, u.String())
-		}*/
-		if len(stream_info) <= 0 && value.Get("sFlvUrl").Exists() {
-			anticode, err := l.processAntiCode(value.Get("sFlvAntiCode").String(), value.Get("sStreamName").String())
-			if err != nil {
-				log.Println(fmt.Sprintf("processing anticode error: %s", err.Error()))
-				return false
-			}
-			u, err := url.Parse(fmt.Sprintf("%s/%s.%s?%s",
-				value.Get("sFlvUrl").String(),
-				value.Get("sStreamName").String(),
-				value.Get("sFlvUrlSuffix").String(),
-				anticode))
-			if err != nil {
-				log.Println(err.Error())
-				return false
-			}
-			u.Scheme = "https"
-			flv_stream_info = append(flv_stream_info, u.String())
-		}
-		return true
-	})
-	stream_info = slices.Concat(flv_stream_info, hls_stream_info)
-	if len(stream_info) <= 0 {
-		return "", errors.New("no validate link found")
-	}
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-
-	switch format {
-	case "flv":
-		if len(flv_stream_info) <= 0 {
-			return "", errors.New("no validate flv link found")
-		}
-		return flv_stream_info[r.Intn(len(flv_stream_info)-1)], nil
-	case "hls":
-		if len(hls_stream_info) <= 0 {
-			return "", errors.New("no validate hls link found")
-		}
-		return hls_stream_info[r.Intn(len(hls_stream_info)-1)], nil
-	default:
-		return stream_info[r.Intn(len(stream_info)-1)], nil
-	}
-}
-
-func (l *Link) getRoomInfo() (err error) {
-	log := global.Log.WithField("function", "app.engine.extractor.HuYa.getRoomInfo")
-	var (
-		req  *http.Request
-		resp *http.Response
-		body []byte
-	)
-	req, err = http.NewRequest("GET", fmt.Sprintf("https://m.huya.com/%s", l.rid), nil)
-	if err != nil {
-		return fmt.Errorf("making request for get room info error: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", global.DEFAULT_MOBILE_USER_AGENT)
-	resp, err = l.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("sending request for get room info error: %w", err)
-	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			log.Fatalln(err.Error())
-		}
-	}(resp.Body)
-	body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-	re := regexp.MustCompile(`<script> window.HNF_GLOBAL_INIT = ((.|\n)*) </script>`)
-	result := re.FindStringSubmatch(string(body))
-	if len(result) < 2 {
-		return errors.New("HNF_GLOBAL_INIT not found")
-	}
-	log.WithField("HNF_GLOBAL_INIT", result[1]).Debugln("extract room info")
-	vm := goja.New()
-	_, err = vm.RunString(fmt.Sprintf(`
-function init(){
-	var obj = %s;
-	var json = JSON.stringify(obj, function(key, value) {
-  		if (typeof value === "function") {
-    		return "/Function(" + value.toString() + ")/";
-		}
-  		return value;
-	});
-	var obj2 = JSON.parse(json, function(key, value) {
-  		if (typeof value === "string" &&
-      		value.startsWith("/Function(") &&
-      		value.endsWith(")/")) {
-    		value = value.substring(10, value.length - 2);
-    		return (0, eval)("(" + value + ")");
-  		}
-  		return value;
-	});
-	return JSON.stringify(obj2)
-};
-`, result[1]))
-	if err != nil {
-		return fmt.Errorf("getting js result error: %w", err)
-	}
-	jsinit, ok := goja.AssertFunction(vm.Get("init"))
-	if !ok {
-		return fmt.Errorf("js init not found")
-	}
-
-	res, err := jsinit(goja.Undefined())
-	if err != nil {
-		return fmt.Errorf("getting js result error: %w", err)
-	}
-	log.WithField("data", res.Export().(string)).Debugln("extract room info")
-
-	l.res = gjson.Parse(res.Export().(string))
-	return nil
-}
-
-func (l *Link) getUUID() {
-	now := time.Now().UnixMilli()
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	random := int64(r.Intn(1000-0)+0) | 0
-	l.uuid = strconv.FormatInt((now%10000000000*1000+random)%4294967295, 10)
-}
-
-func (l *Link) processAntiCode(anticode string, streamname string) (params string, err error) {
-	log := global.Log.WithField("function", "app.engine.extractor.HuYa.processAntiCode")
-	q, err := url.ParseQuery(anticode)
-	if err != nil {
-		return "", fmt.Errorf("parsing anticode error: %w", err)
-	}
-	q.Set("ver", "1")
-	q.Set("sv", "202412311405")
-	q.Set("seqid", strconv.FormatInt(l.uidi+time.Now().UnixMilli(), 10))
-	q.Set("uid", l.uid)
-	q.Set("uuid", l.uuid)
-	ssb := md5.Sum([]byte(fmt.Sprintf("%s|%s|%s", q.Get("seqid"), q.Get("ctype"), q.Get("t"))))
-	ss := hex.EncodeToString(ssb[:])
-	fm_orig, err := base64.StdEncoding.DecodeString(q.Get("fm"))
-	if err != nil {
-		return "", fmt.Errorf("decoding fm error: %w", err)
-	}
-	fm_orig_str := string(fm_orig)
-	log.WithField("field", "decoded fm").Debug(fm_orig_str)
-	fm_orig_str = strings.Replace(fm_orig_str, "$0", l.uid, -1)
-	fm_orig_str = strings.Replace(fm_orig_str, "$1", streamname, -1)
-	fm_orig_str = strings.Replace(fm_orig_str, "$2", ss, -1)
-	fm_orig_str = strings.Replace(fm_orig_str, "$3", q.Get("wsTime"), -1)
-	wss := md5.Sum([]byte(fm_orig_str))
-	q.Set("wsSecret", hex.EncodeToString(wss[:]))
-	q.Del("fm")
-	if q.Has("txyp") {
-		q.Del("txyp")
-	}
-	return q.Encode(), nil
 }

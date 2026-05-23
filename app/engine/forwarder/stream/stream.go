@@ -57,6 +57,8 @@ type Stream struct {
 // fetchFn is called to actually fetch the stream data given a URL.
 // opts can be used to configure the stream (e.g. WithWriterWrapper).
 func NewStream(extractFn ExtractFunc, fetchFn FetchFunc, opts ...StreamOption) *Stream {
+	log := global.Log.WithField("func", "app.engine.forwarder.stream.NewStream")
+	log.Debugln("creating stream")
 	s := &Stream{
 		pipe: NewPipe(),
 		done: make(chan struct{}),
@@ -75,6 +77,8 @@ func (s *Stream) Read(p []byte) (int, error) {
 
 // Close terminates the stream.
 func (s *Stream) Close() error {
+	log := global.Log.WithField("func", "app.engine.forwarder.stream.Close")
+	log.Debugln("closing stream")
 	s.closeOnce.Do(func() {
 		s.pipe.BreakWithError(io.ErrClosedPipe)
 		close(s.done)
@@ -84,12 +88,14 @@ func (s *Stream) Close() error {
 
 // Wait blocks until the producer goroutine finishes and returns the final error.
 func (s *Stream) Wait() error {
+	log := global.Log.WithField("func", "app.engine.forwarder.stream.Wait")
+	log.Debugln("waiting for stream to finish")
 	<-s.done
 	return s.closeErr
 }
 
 func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
-	log := global.Log.WithField("function", "app.engine.forwarder.stream.produce")
+	log := global.Log.WithField("func", "app.engine.forwarder.stream.produce")
 	var previous *ExtractResult
 
 	for {
@@ -143,6 +149,8 @@ func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 }
 
 func (s *Stream) closeWithError(err error) {
+	log := global.Log.WithField("func", "app.engine.forwarder.stream.closeWithError")
+	log.Warnf("closing stream with error: %s", err.Error())
 	s.closeErr = err
 	s.pipe.CloseWithError(err)
 	close(s.done)
@@ -157,9 +165,13 @@ func formatMatches(a, b string) bool {
 		return false
 	}
 	if ua.Scheme != ub.Scheme {
+		log := global.Log.WithField("func", "app.engine.forwarder.stream.formatMatches")
+		log.Debugf("scheme mismatch: %s vs %s", ua.Scheme, ub.Scheme)
 		return false
 	}
 	if path.Ext(ua.Path) != path.Ext(ub.Path) {
+		log := global.Log.WithField("func", "app.engine.forwarder.stream.formatMatches")
+		log.Debugf("extension mismatch: %s vs %s", path.Ext(ua.Path), path.Ext(ub.Path))
 		return false
 	}
 	return true

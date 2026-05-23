@@ -3,6 +3,8 @@ package flv
 import (
 	"io"
 	"sync"
+
+	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
 type detectState int
@@ -26,6 +28,8 @@ type HeaderCacheWriter struct {
 }
 
 func NewHeaderCacheWriter(next io.Writer, cache *HeaderCache, key string) *HeaderCacheWriter {
+	log := global.Log.WithField("func", "app.engine.forwarder.flv.NewHeaderCacheWriter")
+	log.WithField("key", key).Debug("creating HeaderCacheWriter")
 	return &HeaderCacheWriter{
 		next:  next,
 		cache: cache,
@@ -35,6 +39,7 @@ func NewHeaderCacheWriter(next io.Writer, cache *HeaderCache, key string) *Heade
 }
 
 func (w *HeaderCacheWriter) Write(p []byte) (int, error) {
+	log := global.Log.WithField("func", "app.engine.forwarder.flv.Write")
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -51,12 +56,14 @@ func (w *HeaderCacheWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	case offset == 0:
 		// Not valid FLV or no header detected; passthrough everything.
+		log.Debug("no FLV header detected, switching to passthrough mode")
 		w.state = statePassthrough
 		_, err := w.next.Write(w.buf)
 		w.buf = nil
 		return len(p), err
 	default:
 		// Header detected: cache it, write remaining media data.
+		log.WithField("headerSize", offset).Debug("FLV header detected and cached")
 		entry := w.cache.GetOrCreate(w.key)
 		entry.Set(w.buf[:offset])
 		w.state = statePassthrough
@@ -70,6 +77,7 @@ func (w *HeaderCacheWriter) Write(p []byte) (int, error) {
 // Returns -1 if the boundary cannot be determined yet (incomplete data).
 // Returns 0 if the data does not appear to be valid FLV.
 func (w *HeaderCacheWriter) detectHeaderBoundary() int {
+	log := global.Log.WithField("func", "app.engine.forwarder.flv.detectHeaderBoundary")
 	buf := w.buf
 
 	// Minimum: FLV header (9) + PreviousTagSize0 (4) = 13
@@ -106,6 +114,7 @@ func (w *HeaderCacheWriter) detectHeaderBoundary() int {
 		}
 
 		// Media data tag found; this is the boundary.
+		log.WithField("offset", offset).Debug("FLV header boundary found")
 		return offset
 	}
 
