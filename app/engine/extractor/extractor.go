@@ -8,9 +8,10 @@ import (
 
 // Result holds the resolved stream URL and any headers required to fetch it.
 type Result struct {
-	URL      string
-	Headers  http.Header
-	ExpireAt *time.Time // when the URL expires; nil means unknown or no expiry
+	URL             string
+	Headers         http.Header
+	ExpireAt        *time.Time // when the URL expires; nil means unknown or no expiry
+	VariantSelector any        // optional func([]*libm3u8.Variant) *libm3u8.Variant; used by HLS forwarder
 }
 
 // Extractor is the unified interface that every platform extractor must implement.

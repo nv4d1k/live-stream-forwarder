@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/hls"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
@@ -86,7 +87,11 @@ func (l *Link) Extract(_ string) (*extractor.Result, error) {
 	headers.Set("Referer", "https://kick.com/")
 	headers.Set("Origin", "https://kick.com")
 
-	result := &extractor.Result{URL: ch.PlaybackURL, Headers: headers}
+	result := &extractor.Result{
+		URL:             ch.PlaybackURL,
+		Headers:         headers,
+		VariantSelector: hls.PickSecondHighestBandwidthVariant,
+	}
 
 	if exp, err := parseJWTExp(ch.PlaybackURL); err == nil {
 		result.ExpireAt = &exp

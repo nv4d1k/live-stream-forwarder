@@ -186,9 +186,10 @@ func Forwarder(c *gin.Context) {
 			return nil, fmt.Errorf("extract error: %w", err)
 		}
 		streamResult := &stream.ExtractResult{
-			URL:      result.URL,
-			Headers:  result.Headers,
-			ExpireAt: result.ExpireAt,
+			URL:             result.URL,
+			Headers:         result.Headers,
+			ExpireAt:        result.ExpireAt,
+			VariantSelector: result.VariantSelector,
 		}
 		u, parseErr := url.Parse(result.URL)
 		if parseErr != nil {

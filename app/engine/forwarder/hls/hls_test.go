@@ -81,6 +81,68 @@ low.m3u8
 	}
 }
 
+func TestPickSecondHighestBandwidthVariant(t *testing.T) {
+	// Multiple variants: should pick second highest.
+	masterPlaylist := `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360
+low.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
+mid.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+high.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=854x480
+mid2.m3u8
+`
+	playlist, _, err := m3u8.DecodeFrom(strings.NewReader(masterPlaylist), true)
+	if err != nil {
+		t.Fatalf("failed to parse master playlist: %v", err)
+	}
+	masterPl := playlist.(*m3u8.MasterPlaylist)
+
+	second := PickSecondHighestBandwidthVariant(masterPl.Variants)
+	if second.Bandwidth != 2000000 {
+		t.Errorf("PickSecondHighestBandwidthVariant returned bandwidth=%d, want 2000000", second.Bandwidth)
+	}
+	if second.URI != "mid.m3u8" {
+		t.Errorf("PickSecondHighestBandwidthVariant returned URI=%s, want mid.m3u8", second.URI)
+	}
+
+	// Single variant: should fall back to highest.
+	singlePlaylist := `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+only.m3u8
+`
+	playlist2, _, err := m3u8.DecodeFrom(strings.NewReader(singlePlaylist), true)
+	if err != nil {
+		t.Fatalf("failed to parse single variant playlist: %v", err)
+	}
+	masterPl2 := playlist2.(*m3u8.MasterPlaylist)
+	second = PickSecondHighestBandwidthVariant(masterPl2.Variants)
+	if second.Bandwidth != 800000 {
+		t.Errorf("PickSecondHighestBandwidthVariant with single variant returned bandwidth=%d, want 800000", second.Bandwidth)
+	}
+
+	// Two variants: should pick the lower one.
+	twoPlaylist := `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=3840x2160
+best.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720
+lower.m3u8
+`
+	playlist3, _, err := m3u8.DecodeFrom(strings.NewReader(twoPlaylist), true)
+	if err != nil {
+		t.Fatalf("failed to parse two-variant playlist: %v", err)
+	}
+	masterPl3 := playlist3.(*m3u8.MasterPlaylist)
+	second = PickSecondHighestBandwidthVariant(masterPl3.Variants)
+	if second.Bandwidth != 3000000 {
+		t.Errorf("PickSecondHighestBandwidthVariant with two variants returned bandwidth=%d, want 3000000", second.Bandwidth)
+	}
+	if second.URI != "lower.m3u8" {
+		t.Errorf("PickSecondHighestBandwidthVariant returned URI=%s, want lower.m3u8", second.URI)
+	}
+}
+
 func TestResolveURL(t *testing.T) {
 	tests := []struct {
 		name     string

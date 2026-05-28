@@ -20,9 +20,10 @@ type ExtractFunc func(previous *ExtractResult) (*ExtractResult, error)
 
 // ExtractResult holds the resolved URL and optional headers needed to fetch it.
 type ExtractResult struct {
-	URL      string
-	Headers  http.Header
-	ExpireAt *time.Time // when the URL expires; nil means unknown or no expiry
+	URL             string
+	Headers         http.Header
+	ExpireAt        *time.Time // when the URL expires; nil means unknown or no expiry
+	VariantSelector any        // optional func([]*libm3u8.Variant) *libm3u8.Variant; used by HLS forwarder
 }
 
 // FetchFunc returns the upstream response body for a given URL.

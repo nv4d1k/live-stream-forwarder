@@ -79,6 +79,7 @@ func (s *HLSStream) produce() {
 	var previous *stream.ExtractResult
 	var mediaPlaylistURL string
 	var currentHeaders http.Header
+	var currentVariantSelector func([]*libm3u8.Variant) *libm3u8.Variant
 	var lastSeqID uint64
 	var hasLastSeqID bool
 	var initSegmentFetched bool
@@ -137,6 +138,11 @@ func (s *HLSStream) produce() {
 			previous = result
 			mediaPlaylistURL = result.URL
 			currentHeaders = result.Headers
+			if sel, ok := result.VariantSelector.(func([]*libm3u8.Variant) *libm3u8.Variant); ok {
+				currentVariantSelector = sel
+			} else {
+				currentVariantSelector = nil
+			}
 			hasLastSeqID = false
 			initSegmentFetched = false
 			scheduleRefresh(result.ExpireAt)
@@ -169,7 +175,12 @@ func (s *HLSStream) produce() {
 				mediaPlaylistURL = ""
 				continue
 			}
-			variant := pickHighestBandwidthVariant(masterpl.Variants)
+			var variant *libm3u8.Variant
+			if currentVariantSelector != nil {
+				variant = currentVariantSelector(masterpl.Variants)
+			} else {
+				variant = pickHighestBandwidthVariant(masterpl.Variants)
+			}
 			resolved := resolveURL(mediaPlaylistURL, variant.URI)
 			mediaPlaylistURL = resolved
 			continue // Re-fetch as media playlist.
@@ -367,4 +378,29 @@ func pickHighestBandwidthVariant(variants []*libm3u8.Variant) *libm3u8.Variant {
 	}
 	log.Debugf("selected variant bandwidth=%d uri=%s", best.Bandwidth, best.URI)
 	return best
+}
+
+// PickSecondHighestBandwidthVariant selects the variant with the second
+// highest bandwidth. Falls back to the highest if only one variant exists.
+// Exported for use as a VariantSelector callback by extractors.
+func PickSecondHighestBandwidthVariant(variants []*libm3u8.Variant) *libm3u8.Variant {
+	log := global.Log.WithField("func", "app.engine.forwarder.hls.PickSecondHighestBandwidthVariant")
+	if len(variants) <= 1 {
+		return pickHighestBandwidthVariant(variants)
+	}
+	highest := variants[0]
+	second := variants[1]
+	if second.Bandwidth > highest.Bandwidth {
+		highest, second = second, highest
+	}
+	for _, v := range variants[2:] {
+		if v.Bandwidth > highest.Bandwidth {
+			second = highest
+			highest = v
+		} else if v.Bandwidth > second.Bandwidth {
+			second = v
+		}
+	}
+	log.Debugf("selected variant bandwidth=%d uri=%s", second.Bandwidth, second.URI)
+	return second
 }

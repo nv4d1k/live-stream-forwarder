@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	libm3u8 "github.com/grafov/m3u8"
+
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/sirupsen/logrus"
@@ -134,6 +136,16 @@ func TestKick_Extract_LiveWithPlaybackURL(t *testing.T) {
 	if result.ExpireAt.Unix() != expectedExpire.Unix() {
 		t.Errorf("ExpireAt = %v, want %v", result.ExpireAt, expectedExpire)
 	}
+
+	// Verify VariantSelector is set.
+	if result.VariantSelector == nil {
+		t.Fatal("VariantSelector should not be nil")
+	}
+	sel, ok := result.VariantSelector.(func([]*libm3u8.Variant) *libm3u8.Variant)
+	if !ok {
+		t.Fatal("VariantSelector is not the expected function type")
+	}
+	_ = sel
 }
 
 func TestKick_Extract_Offline(t *testing.T) {
