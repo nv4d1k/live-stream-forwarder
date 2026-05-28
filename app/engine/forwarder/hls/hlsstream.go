@@ -3,6 +3,7 @@ package hls
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -145,9 +146,14 @@ func (s *HLSStream) produce() {
 		// Poll phase: fetch and parse the playlist.
 		playlist, listType, err := fetchAndParseM3U8(s.hc, mediaPlaylistURL, currentHeaders)
 		if err != nil {
-			if isRetriableHLS(err) {
-				log.Warnf("playlist fetch retriable error: %s, re-extracting", err.Error())
+			if isExpiredHLS(err) {
+				log.Warnf("playlist fetch 403, re-extracting: %s", err.Error())
 				mediaPlaylistURL = ""
+				continue
+			}
+			if isTransientHLS(err) {
+				log.Warnf("playlist fetch transient error, retrying: %s", err.Error())
+				time.Sleep(2 * time.Second)
 				continue
 			}
 			log.Errorf("playlist fetch error: %s", err.Error())
@@ -175,9 +181,14 @@ func (s *HLSStream) produce() {
 			if mediapl.Map != nil && mediapl.Map.URI != "" && !initSegmentFetched {
 				segURL := resolveURL(mediaPlaylistURL, mediapl.Map.URI)
 				if err := s.fetchAndPipeSegment(segURL, currentHeaders); err != nil {
-					if isRetriableHLS(err) {
-						log.Warnf("init segment fetch retriable error: %s, re-extracting", err.Error())
+					if isExpiredHLS(err) {
+						log.Warnf("init segment fetch 403, re-extracting: %s", err.Error())
 						mediaPlaylistURL = ""
+						continue
+					}
+					if isTransientHLS(err) {
+						log.Warnf("init segment fetch transient error, retrying: %s", err.Error())
+						time.Sleep(2 * time.Second)
 						continue
 					}
 					s.closeWithError(err)
@@ -197,10 +208,15 @@ func (s *HLSStream) produce() {
 
 				segURL := resolveURL(mediaPlaylistURL, seg.URI)
 				if err := s.fetchAndPipeSegment(segURL, currentHeaders); err != nil {
-					if isRetriableHLS(err) {
-						log.Warnf("segment fetch retriable error: %s, re-extracting", err.Error())
+					if isExpiredHLS(err) {
+						log.Warnf("segment fetch 403, re-extracting: %s", err.Error())
 						mediaPlaylistURL = ""
 						break
+					}
+					if isTransientHLS(err) {
+						log.Warnf("segment fetch transient error, skipping: %s", err.Error())
+						time.Sleep(1 * time.Second)
+						continue
 					}
 					s.closeWithError(err)
 					return
@@ -310,11 +326,35 @@ func resolveURL(baseURL, refURL string) string {
 	return base.ResolveReference(ref).String()
 }
 
-func isRetriableHLS(err error) bool {
+// isExpiredHLS reports whether the error indicates the URL has expired (403),
+// requiring re-extraction to obtain a fresh URL.
+func isExpiredHLS(err error) bool {
 	if err == nil {
 		return false
 	}
 	return strings.Contains(err.Error(), "403")
+}
+
+// isTransientHLS reports whether the error is a transient network issue
+// (EOF, connection reset, timeout) that can be retried with the same URL.
+func isTransientHLS(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "EOF") {
+		return true
+	}
+	if strings.Contains(msg, "connection reset") {
+		return true
+	}
+	if strings.Contains(msg, "temporary") {
+		return true
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 func pickHighestBandwidthVariant(variants []*libm3u8.Variant) *libm3u8.Variant {

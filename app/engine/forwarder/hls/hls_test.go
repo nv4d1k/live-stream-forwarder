@@ -2,6 +2,8 @@ package hls
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -134,7 +136,7 @@ func TestResolveURL(t *testing.T) {
 	}
 }
 
-func TestIsRetriableHLS(t *testing.T) {
+func TestIsExpiredHLS(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -160,14 +162,81 @@ func TestIsRetriableHLS(t *testing.T) {
 			err:  errors.New("fetch segment err got: HTTP 403"),
 			want: true,
 		},
+		{
+			name: "EOF error is not expired",
+			err:  errors.New("unexpected EOF"),
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isRetriableHLS(tt.err)
+			got := isExpiredHLS(tt.err)
 			if got != tt.want {
-				t.Errorf("isRetriableHLS(%v) = %v, want %v", tt.err, got, tt.want)
+				t.Errorf("isExpiredHLS(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
 }
+
+func TestIsTransientHLS(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "EOF error",
+			err:  errors.New("unexpected EOF"),
+			want: true,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "connection reset",
+			err:  errors.New("connection reset by peer"),
+			want: true,
+		},
+		{
+			name: "403 is not transient",
+			err:  errors.New("HTTP 403 Forbidden"),
+			want: false,
+		},
+		{
+			name: "timeout error",
+			err:  &timeoutError{},
+			want: true,
+		},
+		{
+			name: "other error",
+			err:  errors.New("some other error"),
+			want: false,
+		},
+		{
+			name: "temporary in message",
+			err:  fmt.Errorf("dial tcp: temporary failure in name resolution"),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTransientHLS(tt.err)
+			if got != tt.want {
+				t.Errorf("isTransientHLS(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// timeoutError implements net.Error for testing.
+type timeoutError struct{}
+
+func (e *timeoutError) Error() string   { return "timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return true }
+
+var _ net.Error = (*timeoutError)(nil)
