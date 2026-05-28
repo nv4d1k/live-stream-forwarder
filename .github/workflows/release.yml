@@ -1,27 +1,109 @@
-name: Release binary
+name: Release
+
 on:
-  workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
 jobs:
-  build-go-binary:
+  # ── Build binaries & create GitHub Release ──────────────────────────
+  release:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
     steps:
       - uses: actions/checkout@v4
-      - name: Set APP_VERSION env
-        run: echo APP_VERSION=$(echo ${GITHUB_REF} | rev | cut -d'/' -f 1 | rev ) >> ${GITHUB_ENV}
-      - name: Set BUILD_TIME env
-        run: echo BUILD_TIME=$(date +'%Y-%m-%d %H:%M:%S') >> ${GITHUB_ENV}
-      - uses: wangyoucao577/go-release-action@v1.46
+
+      - name: Set version info
+        run: |
+          echo "APP_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "BUILD_TIME=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          go build -trimpath \
+            -ldflags="-X 'github.com/nv4d1k/live-stream-forwarder/global.Version=${{ env.APP_VERSION }}' -X 'github.com/nv4d1k/live-stream-forwarder/global.BuildTime=${{ env.BUILD_TIME }}' -X github.com/nv4d1k/live-stream-forwarder/global.GitCommit=${{ github.sha }}" \
+            -o "lsf${ext}" .
+
+      - name: Package archive
+        run: |
+          ext=""
+          [ "${{ matrix.goos }}" = "windows" ] && ext=".exe"
+          archive="lsf_${{ env.APP_VERSION }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+
+          mkdir -p "${archive}"
+          cp "lsf${ext}" "${archive}/"
+          cp README.md LICENSE.txt "${archive}/"
+          [ -d contrib ] && cp -r contrib "${archive}/"
+
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            7z a "${archive}.zip" "${archive}"
+          else
+            tar czf "${archive}.tar.gz" "${archive}"
+          fi
+
+      - name: Upload release artifact
+        uses: softprops/action-gh-release@v2
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          goos: ${{ matrix.goos }}
-          goarch: ${{ matrix.goarch }}
-          build_flags: -v
-          binary_name: "lsf"
-          extra_files: contrib README.md LICENSE.txt
-          ldflags: -X "github.com/nv4d1k/live-stream-forwarder/global.Version=${{ env.APP_VERSION }}" -X "github.com/nv4d1k/live-stream-forwarder/global.BuildTime=${{ env.BUILD_TIME }}" -X github.com/nv4d1k/live-stream-forwarder/global.GitCommit=${{ github.sha }}
+          files: |
+            lsf_*.tar.gz
+            lsf_*.zip
+
+  # ── Build & push multi-arch Docker image ────────────────────────────
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version info
+        run: |
+          echo "APP_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "BUILD_TIME=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8,linux/ppc64le,linux/riscv64,linux/s390x
+          build-args: |
+            VERSION=${{ env.APP_VERSION }}
+            BUILD_TIME=${{ env.BUILD_TIME }}
+            SHA=${{ github.sha }}
+          tags: |
+            nv4d1k/live-stream-forwarder:latest
+            nv4d1k/live-stream-forwarder:${{ env.APP_VERSION }}

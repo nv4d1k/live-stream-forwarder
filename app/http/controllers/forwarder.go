@@ -16,6 +16,7 @@ import (
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/DouYin"
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/DouYu"
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/HuYa"
+	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/Kick"
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/Twitch"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
@@ -185,8 +186,9 @@ func Forwarder(c *gin.Context) {
 			return nil, fmt.Errorf("extract error: %w", err)
 		}
 		streamResult := &stream.ExtractResult{
-			URL:     result.URL,
-			Headers: result.Headers,
+			URL:      result.URL,
+			Headers:  result.Headers,
+			ExpireAt: result.ExpireAt,
 		}
 		u, parseErr := url.Parse(result.URL)
 		if parseErr != nil {

@@ -52,7 +52,7 @@ Live Stream Forwarder (`lsf`) converts live streams from Chinese and internation
 **Extractors** (`app/engine/extractor/<Platform>/`) — resolve a room ID to a stream URL:
 
 All extractors implement the unified `Extractor` interface (`app/engine/extractor/extractor.go`):
-- `Extract(format) (*Result, error)` — returns URL + required headers
+- `Extract(format) (*Result, error)` — returns URL + required headers + optional ExpireAt
 - `SupportedFormats() []string` — e.g. `["flv", "m3u8"]`
 - `DefaultFormat() string` — fallback when caller doesn't specify
 
@@ -64,15 +64,16 @@ Platform specifics:
 - **BiliBili**: v1 API (`/room/v1/Room/playUrl`) tried first for higher quality (returns qn=10000 for unauthenticated users), falls back to v2 API (`getRoomPlayInfo`) which may degrade quality; `Mobile: false`; Referer header required
 - **DouYin**: cookie auth (`__ac_nonce`/`ttwid`), extracts JSON from `self.__pace_f.push` in `<script>` tags
 - **Twitch**: hardcoded public Client-ID (`kimne78kx3ncx6brgo4mv6wki5h1ko`), GraphQL `PlaybackAccessToken_Template` for sig+token, Usher HLS master playlist; `SupportedFormats: ["m3u8"]`
+- **Kick**: public `/api/v2/channels/<slug>` returns `playback_url` (AWS IVS HLS master + ES384 JWT). No auth/cookies needed. JWT `exp` claim parsed via `parseJWTExp()` and set as `Result.ExpireAt`. Headers include `Referer` and `Origin` for AWS IVS origin enforcement. `Extract()` calls API every time (not cached in constructor) so 403 retries auto-refresh the JWT. `SupportedFormats: ["m3u8"]`
 
 **Forwarders** (`app/engine/forwarder/<type>/`) — pipe stream data from upstream to client:
 
 All forwarders use a **Pipe-based architecture** for seamless 403 recovery. When an upstream URL expires (403), the producer goroutine re-calls the extractor to get a fresh URL and reconnects — the client never sees a break.
 
-- `stream/` — shared `Pipe` (goroutine-safe buffered io.Reader/io.Writer) and `Stream` (producer goroutine with infinite 403 retry loop). `ExtractFunc` signature is `func(previous *ExtractResult) (*ExtractResult, error)` — receives the previous result on retries so format consistency (scheme + path extension) can be validated via `formatMatches()`. Retries are unlimited; only stops on client disconnect or non-retriable errors.
+- `stream/` — shared `Pipe` (goroutine-safe buffered io.Reader/io.Writer) and `Stream` (producer goroutine with infinite 403 retry loop). `ExtractFunc` signature is `func(previous *ExtractResult) (*ExtractResult, error)` — receives the previous result on retries so format consistency (scheme + path extension) can be validated via `formatMatches()`. Retries are unlimited; only stops on client disconnect or non-retriable errors. `ExtractResult` carries `ExpireAt *time.Time` so forwarders can proactively refresh before URL expiry.
 - `httpweb/` — `Stream(extractFn)` returns `*stream.Stream` for HTTP/FLV; `Forward()` kept for backward compat. `AddHeaderTransport` injects User-Agent (desktop or mobile).
 - `flv/` — `FLVStream` wraps a `*stream.Stream` and prepends cached FLV header for mid-stream client connections. `HeaderCache` is keyed by `"platform:room"`, process-wide via `DefaultCache`. `HeaderCacheWriter` captures the first bytes of the stream as the FLV header.
-- `hls/` — `HLSStream` has its own produce loop: fetches/parse m3u8, downloads segments, pipes raw MPEG-TS. Master playlist variant selection picks **highest BANDWIDTH** (`pickHighestBandwidthVariant`). 403 on any playlist/segment clears `mediaPlaylistURL` and re-extracts.
+- `hls/` — `HLSStream` has its own produce loop: fetches/parse m3u8, downloads segments, pipes raw MPEG-TS. Master playlist variant selection picks **highest BANDWIDTH** (`pickHighestBandwidthVariant`). 403 on any playlist/segment clears `mediaPlaylistURL` and re-extracts. **Proactive token refresh**: when `ExtractResult.ExpireAt` is set, a `time.AfterFunc` timer fires 60s before expiry (minimum 5s from now) and sends on `refreshCh`, causing the produce loop to re-extract before the URL expires. Platforms without `ExpireAt` are unaffected.
 - `websocket/` — `WebSocketForwarderWithRetry(extractFn)` uses `XP2PClientWithRetry` which validates re-extracted URLs are still ws/wss and reconnects within `ReadLoop`.
 
 ### HTTP layer
@@ -86,7 +87,7 @@ All forwarders use a **Pipe-based architecture** for seamless 403 recovery. When
 ```
 GET /douyu/12345
   → controller: extractor.Registry["douyu"].Factory("12345", proxy)
-  → ext.Extract(desiredFormat) → *Result{URL, Headers}
+  → ext.Extract(desiredFormat) → *Result{URL, Headers, ExpireAt}
   → extractFn closure wraps ext.Extract with format consistency checks
   → extractFn(nil) → first extraction → determine initialFormat
   → dispatchStream by scheme/extension:
@@ -112,6 +113,7 @@ GET /douyu/12345
 - **HLS variant selection**: `pickHighestBandwidthVariant` in `hls/hlsstream.go` always selects the highest bandwidth variant from master playlists, giving the best quality across all HLS platforms.
 - **FLV header caching**: `flv.DefaultCache` stores the FLV header per `"platform:room"` key so late-joining clients receive the header before live data, enabling mid-stream connection without player errors.
 - **Format consistency on retry**: `ExtractFunc(previous)` receives the previous result on retry. The controller and `Stream.produce()` both validate that re-extracted URLs have the same scheme and path extension (e.g. won't switch from FLV to m3u8 mid-stream).
+- **Proactive token refresh (HLS)**: `ExtractResult.ExpireAt` signals when a URL will expire. The HLS forwarder schedules a `time.AfterFunc` to re-extract 60s before expiry (adjusting for short-lived tokens). The FLV/WebSocket paths rely on 403-triggered re-extraction only. Extractors that don't set `ExpireAt` are unaffected.
 - **Proxy threading**: CLI `--proxy` flag or per-request `?proxy=` query param → Gin middleware sets in context → passed through extractors and forwarders.
 - **Gin version is pinned to 1.11.0** (downgraded due to nil pointer issue in Docker containers).
 - **403 retry detection**: `isRetriable()` in `stream/stream.go` checks for "403" substring in error messages — this is string-based, not status-code-based.

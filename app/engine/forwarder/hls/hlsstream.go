@@ -24,6 +24,9 @@ type HLSStream struct {
 	closeOnce sync.Once
 	hc        *http.Client
 	extractFn stream.ExtractFunc
+
+	// refreshCh signals the produce loop to re-extract before the URL expires.
+	refreshCh chan struct{}
 }
 
 func NewHLSStream(extractFn stream.ExtractFunc, hc *http.Client) *HLSStream {
@@ -34,6 +37,7 @@ func NewHLSStream(extractFn stream.ExtractFunc, hc *http.Client) *HLSStream {
 		done:      make(chan struct{}),
 		hc:        hc,
 		extractFn: extractFn,
+		refreshCh: make(chan struct{}, 1),
 	}
 	go s.produce()
 	return s
@@ -78,6 +82,43 @@ func (s *HLSStream) produce() {
 	var hasLastSeqID bool
 	var initSegmentFetched bool
 
+	// scheduleRefresh sets a timer to trigger re-extraction before the URL expires.
+	var refreshTimer *time.Timer
+	scheduleRefresh := func(expireAt *time.Time) {
+		if refreshTimer != nil {
+			refreshTimer.Stop()
+			refreshTimer = nil
+		}
+		if expireAt == nil {
+			return
+		}
+		// Refresh 60 seconds before expiry, but no less than 5 seconds from now.
+		leadTime := 60 * time.Second
+		remaining := time.Until(*expireAt)
+		if remaining <= leadTime+5*time.Second {
+			leadTime = remaining - 5*time.Second
+			if leadTime < 0 {
+				leadTime = 0
+			}
+		}
+		when := remaining - leadTime
+		if when < 0 {
+			when = 0
+		}
+		log.Debugf("scheduling token refresh in %s (expires at %s)", when, expireAt.Format(time.RFC3339))
+		refreshTimer = time.AfterFunc(when, func() {
+			select {
+			case s.refreshCh <- struct{}{}:
+			default:
+			}
+		})
+	}
+	defer func() {
+		if refreshTimer != nil {
+			refreshTimer.Stop()
+		}
+	}()
+
 	for {
 		// Check if client disconnected.
 		if s.pipe.Err() != nil {
@@ -97,6 +138,7 @@ func (s *HLSStream) produce() {
 			currentHeaders = result.Headers
 			hasLastSeqID = false
 			initSegmentFetched = false
+			scheduleRefresh(result.ExpireAt)
 			continue
 		}
 
@@ -189,7 +231,7 @@ func (s *HLSStream) produce() {
 			continue
 		}
 
-		// Sleep before next poll.
+		// Sleep before next poll, but wake early if token needs refreshing.
 		targetDur := 3 * time.Second
 		if ml, ok := playlist.(*libm3u8.MediaPlaylist); ok && ml.TargetDuration > 0 {
 			targetDur = time.Duration(ml.TargetDuration) * time.Second
@@ -197,7 +239,17 @@ func (s *HLSStream) produce() {
 		if targetDur < time.Second {
 			targetDur = time.Second
 		}
-		time.Sleep(targetDur)
+
+		select {
+		case <-s.refreshCh:
+			log.Infoln("token refresh triggered, re-extracting")
+			mediaPlaylistURL = ""
+		case <-time.After(targetDur):
+		}
+
+		if s.pipe.Err() != nil {
+			return
+		}
 	}
 }
 

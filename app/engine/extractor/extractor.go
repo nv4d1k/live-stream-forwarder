@@ -3,12 +3,14 @@ package extractor
 import (
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // Result holds the resolved stream URL and any headers required to fetch it.
 type Result struct {
-	URL     string
-	Headers http.Header
+	URL      string
+	Headers  http.Header
+	ExpireAt *time.Time // when the URL expires; nil means unknown or no expiry
 }
 
 // Extractor is the unified interface that every platform extractor must implement.

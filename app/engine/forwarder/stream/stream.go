@@ -8,6 +8,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
@@ -19,8 +20,9 @@ type ExtractFunc func(previous *ExtractResult) (*ExtractResult, error)
 
 // ExtractResult holds the resolved URL and optional headers needed to fetch it.
 type ExtractResult struct {
-	URL     string
-	Headers http.Header
+	URL      string
+	Headers  http.Header
+	ExpireAt *time.Time // when the URL expires; nil means unknown or no expiry
 }
 
 // FetchFunc returns the upstream response body for a given URL.
