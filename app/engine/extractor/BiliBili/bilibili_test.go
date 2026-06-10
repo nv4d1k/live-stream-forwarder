@@ -312,7 +312,7 @@ func TestSelectStreamURL(t *testing.T) {
 			expectURL: "https://cdn1.example.com/live/flv/base/?key=abc",
 		},
 		{
-			name:   "HLS format with fmp4",
+			name:   "HLS format prefers ts over fmp4",
 			format: "m3u8",
 			info: func() *playInfoResponse {
 				resp := &playInfoResponse{Code: 0}
@@ -352,10 +352,10 @@ func TestSelectStreamURL(t *testing.T) {
 				return resp
 			}(),
 			expectErr: false,
-			expectURL: "https://cdn2.example.com/live/hls/fmp4/?key=def",
+			expectURL: "https://cdn3.example.com/live/hls/ts/?key=ts1",
 		},
 		{
-			name:   "HLS fallback to ts when fmp4 absent",
+			name:   "HLS fallback to fmp4 when ts absent",
 			format: "m3u8",
 			info: func() *playInfoResponse {
 				resp := &playInfoResponse{Code: 0}
@@ -364,14 +364,14 @@ func TestSelectStreamURL(t *testing.T) {
 						ProtocolName: "http_hls",
 						Formats: []formatItem{
 							{
-								FormatName: "ts",
+								FormatName: "fmp4",
 								Codecs: []codecItem{
 									{
 										CodecName: "avc",
 										CurrentQn: 10000,
-										BaseURL:   "/live/hls/ts/",
+										BaseURL:   "/live/hls/fmp4/",
 										URLInfo: []urlItem{
-											{Host: "https://cdn4.example.com", Extra: "?key=tsfallback"},
+											{Host: "https://cdn4.example.com", Extra: "?key=fmp4fallback"},
 										},
 									},
 								},
@@ -382,7 +382,7 @@ func TestSelectStreamURL(t *testing.T) {
 				return resp
 			}(),
 			expectErr: false,
-			expectURL: "https://cdn4.example.com/live/hls/ts/?key=tsfallback",
+			expectURL: "https://cdn4.example.com/live/hls/fmp4/?key=fmp4fallback",
 		},
 		{
 			name:   "Error when no matching protocol",

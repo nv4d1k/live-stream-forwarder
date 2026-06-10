@@ -98,7 +98,7 @@ func (l *Link) getPlayInfo() (*playInfoResponse, error) {
 
 // selectStreamURL picks the best stream URL based on the requested format.
 // For "flv": selects http_stream/flv protocol.
-// For "m3u8": selects http_hls protocol, preferring fmp4 over ts.
+// For "m3u8": selects http_hls protocol, preferring ts over fmp4 for compatibility.
 // Codec preference: avc (most compatible) > hevc.
 // CDN node: randomly selected from url_info for load balancing.
 func selectStreamURL(info *playInfoResponse, format string) (string, error) {
@@ -111,8 +111,8 @@ func selectStreamURL(info *playInfoResponse, format string) (string, error) {
 	switch format {
 	case "m3u8", "hls":
 		targetProtocol = "http_hls"
-		targetFormat = "fmp4"
-		fallbackFormat = "ts"
+		targetFormat = "ts"
+		fallbackFormat = "fmp4"
 	default:
 		targetProtocol = "http_stream"
 		targetFormat = "flv"
