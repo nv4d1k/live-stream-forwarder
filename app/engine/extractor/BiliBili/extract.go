@@ -46,14 +46,6 @@ func (l *Link) resolveRoomID() error {
 func (l *Link) GetLink(format string) (*url.URL, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.BiliBili.GetLink")
 
-	// v1 API: returns direct stream URLs, often with higher quality for
-	// unauthenticated users than v2.
-	if u, err := l.getLinkByAPIv1(format); err == nil {
-		log.WithField("field", "stream url (v1)").Debug(u.String())
-		return u, nil
-	}
-
-	// Fallback to v2 API.
 	playInfo, err := l.getPlayInfo()
 	if err != nil {
 		return nil, err
@@ -62,45 +54,8 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.WithField("field", "stream url (v2)").Debug(streamURL)
+	log.WithField("field", "stream url").Debug(streamURL)
 	return url.Parse(streamURL)
-}
-
-func (l *Link) getLinkByAPIv1(format string) (*url.URL, error) {
-	log := global.Log.WithField("func", "app.engine.extractor.BiliBili.getLinkByAPIv1")
-	platform := "web"
-	if format == "m3u8" || format == "hls" {
-		platform = "h5"
-	}
-	resp, err := l.client.Get(fmt.Sprintf(
-		"https://api.live.bilibili.com/room/v1/Room/playUrl?cid=%s&platform=%s&qn=10000",
-		l.rid, platform,
-	))
-	if err != nil {
-		return nil, fmt.Errorf("v1 api request error: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("v1 api read body error: %w", err)
-	}
-	log.WithField("field", "v1 response").Debug(string(body))
-	var result playURLV1Response
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("v1 api parse error: %w", err)
-	}
-	if result.Code != 0 {
-		return nil, fmt.Errorf("v1 api error code %d", result.Code)
-	}
-	if len(result.Data.Durl) == 0 {
-		return nil, errors.New("v1 api returned no streams")
-	}
-	// Pick a random CDN node.
-	du := result.Data.Durl[rand.Intn(len(result.Data.Durl))]
-	if du.URL == "" {
-		return nil, errors.New("v1 api returned empty url")
-	}
-	return url.Parse(du.URL)
 }
 
 func (l *Link) getPlayInfo() (*playInfoResponse, error) {

@@ -171,6 +171,14 @@ func Forwarder(c *gin.Context) {
 		return
 	}
 
+	// 2b. Inject cookie into the extractor if supported.
+	// Cookie is set in context by middleware: from ?cookie= (decoded) or --bilibili-cookie (raw).
+	if cs, ok := ext.(extractor.CookieSetter); ok {
+		if rawCookie := c.GetString("bilibili-cookie"); rawCookie != "" && platform == "bilibili" {
+			cs.SetCookie(rawCookie)
+		}
+	}
+
 	// 3. Resolve the desired format.
 	desiredFormat := resolveDesiredFormat(format, ext)
 

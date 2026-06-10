@@ -20,6 +20,9 @@ go run . --log-level 6
 # Run with HTTP proxy
 go run . --proxy http://user:pass@host:port
 
+# Run with BiliBili cookie for authenticated streams
+go run . --bilibili-cookie "SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx"
+
 # Run tests
 go test -cover -v ./...
 
@@ -40,6 +43,7 @@ docker build --build-arg VERSION=x.x.x --build-arg BUILD_TIME="$(date)" --build-
 | `-l, --listen-address` | `LISTEN_ADDR` | `127.0.0.1` | Bind address |
 | `-p, --listen-port` | `LISTEN_PORT` | `0` (random) | Bind port |
 | `--proxy` | — | — | Global HTTP proxy URL |
+| `--bilibili-cookie` | — | — | Raw cookie string for BiliBili authenticated streams |
 | `--log-level` | — | `3` (warn) | 0–6; 6 = debug, enables `/debug/*` endpoints |
 | `--log-file` | — | stdout | Log file path (also outputs to stdout) |
 
@@ -61,7 +65,7 @@ Each platform registers itself via `init()` calling `extractor.Register(name, Re
 Platform specifics:
 - **DouYu**: MD5 auth chain, encryption data, supports p2p (ws/wss) via `p2p` field (0/2/9/10); `SupportedFormats: ["flv", "m3u8", "ws"]`
 - **HuYa**: goja JS VM to parse `HNF_GLOBAL_INIT` from page HTML, anti-code processing; `GetLink(format)` accepts `flv`/`hls`; `m3u8` is normalized to `hls` internally
-- **BiliBili**: v1 API (`/room/v1/Room/playUrl`) tried first for higher quality (returns qn=10000 for unauthenticated users), falls back to v2 API (`getRoomPlayInfo`) which may degrade quality; `Mobile: false`; Referer header required
+- **BiliBili**: v2 API only (`getRoomPlayInfo` with `qn=10000`); requires Cookie authentication via `?cookie=` query param for qn=10000 (原画); without cookie returns qn=250 (720p); implements `extractor.CookieSetter` for cookie injection into API requests via `cookieTransport`; `Mobile: false`; Referer header required
 - **DouYin**: cookie auth (`__ac_nonce`/`ttwid`), extracts JSON from `self.__pace_f.push` in `<script>` tags
 - **Twitch**: hardcoded public Client-ID (`kimne78kx3ncx6brgo4mv6wki5h1ko`), GraphQL `PlaybackAccessToken_Template` for sig+token, Usher HLS master playlist; `SupportedFormats: ["m3u8"]`
 - **Kick**: public `/api/v2/channels/<slug>` returns `playback_url` (AWS IVS HLS master + ES384 JWT). No auth/cookies needed. JWT `exp` claim parsed via `parseJWTExp()` and set as `Result.ExpireAt`. Headers include `Referer` and `Origin` for AWS IVS origin enforcement. `Extract()` calls API every time (not cached in constructor) so 403 retries auto-refresh the JWT. `SupportedFormats: ["m3u8"]`
@@ -78,9 +82,11 @@ All forwarders use a **Pipe-based architecture** for seamless 403 recovery. When
 
 ### HTTP layer
 
-- `cmd/root.go` — Cobra CLI, sets up Gin router with CORS and proxy middleware. Single route: `GET /:platform/:room`
-- `controllers/forwarder.go` — registry-based dispatch: looks up platform in `extractor.Registry`, creates extractor, builds `ExtractFunc` closure with format consistency checks, dispatches to forwarder by URL scheme/extension via `dispatchStream()`. Format resolution: `?format=` query param → extractor's `SupportedFormats()` → random pick between flv/m3u8 if both available → `DefaultFormat()`. Per-request `?proxy=` overrides the global `--proxy` flag.
+- `cmd/root.go` — Cobra CLI, sets up Gin router with CORS and proxy middleware. Routes: `GET /tools/cookie`, `GET /:platform/:room`
+- `controllers/forwarder.go` — registry-based dispatch: looks up platform in `extractor.Registry`, creates extractor, builds `ExtractFunc` closure with format consistency checks, dispatches to forwarder by URL scheme/extension via `dispatchStream()`. Format resolution: `?format=` query param → extractor's `SupportedFormats()` → random pick between flv/m3u8 if both available → `DefaultFormat()`. Per-request `?proxy=` overrides the global `--proxy` flag. Per-request `?cookie=` (gzip+base64url encoded) overrides the global `--bilibili-cookie` flag; decoded and injected via `extractor.CookieSetter` if the extractor implements it.
 - `controllers/debug.go` — pprof and debug endpoints, only registered when `--log-level 6`
+- `controllers/tools.go` — `CookieTool` handler at `GET /tools/cookie`, serves embedded HTML page (`static/cookie.html`) for encoding cookies into gzip+base64url query-safe strings (works for any platform that supports `?cookie=`)
+- `controllers/cookie.go` — `decodeCookie` utility: base64url decode → gzip decompress → raw cookie string
 
 ### Request flow
 
@@ -115,6 +121,8 @@ GET /douyu/12345
 - **Format consistency on retry**: `ExtractFunc(previous)` receives the previous result on retry. The controller and `Stream.produce()` both validate that re-extracted URLs have the same scheme and path extension (e.g. won't switch from FLV to m3u8 mid-stream).
 - **Proactive token refresh (HLS)**: `ExtractResult.ExpireAt` signals when a URL will expire. The HLS forwarder schedules a `time.AfterFunc` to re-extract 60s before expiry (adjusting for short-lived tokens). The FLV/WebSocket paths rely on 403-triggered re-extraction only. Extractors that don't set `ExpireAt` are unaffected.
 - **Proxy threading**: CLI `--proxy` flag or per-request `?proxy=` query param → Gin middleware sets in context → passed through extractors and forwarders.
+- **Optional CookieSetter interface**: `extractor.CookieSetter` is an optional interface that extractors can implement to receive a raw cookie string. The controller type-asserts after factory creation and calls `SetCookie(rawCookie)` if the `?cookie=` query param is present. Only BiliBili implements it currently. Other extractors are unaffected.
+- **Cookie encoding**: `?cookie=` value is gzip-compressed + base64url-encoded (no padding) to avoid URL issues with semicolons and special characters in raw cookies. Decoded server-side in `controllers/cookie.go`. A tool page at `/tools/cookie` provides client-side encoding using the browser CompressionStream API.
 - **Gin version is pinned to 1.11.0** (downgraded due to nil pointer issue in Docker containers).
 - **403 retry detection**: `isRetriable()` in `stream/stream.go` checks for "403" substring in error messages — this is string-based, not status-code-based.
 - **`.xs` extension**: `dispatchStream` treats `.xs` the same as `.flv` (both route to FLV forwarder).

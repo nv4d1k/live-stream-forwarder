@@ -38,62 +38,83 @@ func TestBiliBili_DefaultFormat(t *testing.T) {
 
 func TestBiliBili_Extract_WithFormat(t *testing.T) {
 	tests := []struct {
-		name           string
-		format         string
-		v1Platform     string
-		v1ResponseCode int
-		v1URLs         []string
-		expectSuffix   string
+		name         string
+		format       string
+		expectSuffix string
+		v2Response   *playInfoResponse
 	}{
 		{
-			name:           "flv format uses web platform",
-			format:         "flv",
-			v1Platform:     "web",
-			v1ResponseCode: 0,
-			v1URLs:         []string{"http://cdn.example.com/live/stream.flv?key=abc"},
-			expectSuffix:   ".flv?key=abc",
+			name:         "flv format",
+			format:       "flv",
+			expectSuffix: ".flv?key=abc",
+			v2Response: func() *playInfoResponse {
+				resp := &playInfoResponse{Code: 0}
+				resp.Data.PlayURLInfo.PlayURL.Streams = []streamItem{
+					{
+						ProtocolName: "http_stream",
+						Formats: []formatItem{
+							{
+								FormatName: "flv",
+								Codecs: []codecItem{
+									{
+										CodecName: "avc",
+										CurrentQn: 10000,
+										BaseURL:   "/live/stream.flv",
+										URLInfo: []urlItem{
+											{Host: "https://cdn.example.com", Extra: "?key=abc"},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+				return resp
+			}(),
 		},
 		{
-			name:           "m3u8 format uses h5 platform",
-			format:         "m3u8",
-			v1Platform:     "h5",
-			v1ResponseCode: 0,
-			v1URLs:         []string{"http://cdn.example.com/live/stream.m3u8?key=abc"},
-			expectSuffix:   ".m3u8?key=abc",
+			name:         "m3u8 format",
+			format:       "m3u8",
+			expectSuffix: ".m3u8?key=abc",
+			v2Response: func() *playInfoResponse {
+				resp := &playInfoResponse{Code: 0}
+				resp.Data.PlayURLInfo.PlayURL.Streams = []streamItem{
+					{
+						ProtocolName: "http_hls",
+						Formats: []formatItem{
+							{
+								FormatName: "fmp4",
+								Codecs: []codecItem{
+									{
+										CodecName: "avc",
+										CurrentQn: 10000,
+										BaseURL:   "/live/stream.m3u8",
+										URLInfo: []urlItem{
+											{Host: "https://cdn.example.com", Extra: "?key=abc"},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+				return resp
+			}(),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Set up mock server that handles both room init and v1 play URL.
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.URL.Path == "/room/v1/Room/room_init":
-					resp := roomInitResponse{
-						Code: 0,
-					}
+					resp := roomInitResponse{Code: 0}
 					resp.Data.RoomID = 99999
 					resp.Data.LiveStatus = 1
 					writeJSON(w, resp)
 
-				case r.URL.Path == "/room/v1/Room/playUrl":
-					// Verify platform parameter matches expected.
-					platform := r.URL.Query().Get("platform")
-					if platform != tt.v1Platform {
-						t.Errorf("expected platform=%s, got %s", tt.v1Platform, platform)
-					}
-
-					resp := playURLV1Response{
-						Code: tt.v1ResponseCode,
-					}
-					for i, u := range tt.v1URLs {
-						resp.Data.Durl = append(resp.Data.Durl, struct {
-							URL   string `json:"url"`
-							Order int    `json:"order"`
-						}{URL: u, Order: i})
-					}
-					resp.Data.CurrentQn = 10000
-					writeJSON(w, resp)
+				case r.URL.Path == "/xlive/web-room/v2/index/getRoomPlayInfo":
+					writeJSON(w, tt.v2Response)
 
 				default:
 					w.WriteHeader(http.StatusNotFound)
@@ -101,19 +122,15 @@ func TestBiliBili_Extract_WithFormat(t *testing.T) {
 			}))
 			defer server.Close()
 
-			// Override the client to point at the test server.
 			l := &Link{
 				rid:    "12345",
 				client: server.Client(),
 			}
-			// Patch resolveRoomID by calling it with the mock server.
-			// We need to override the base URL, so we use a custom round tripper.
 			l.client.Transport = &rewriteBaseTransport{
 				base:    server.URL,
 				wrapped: server.Client().Transport,
 			}
 
-			// Manually resolve room ID using the mock.
 			if err := l.resolveRoomID(); err != nil {
 				t.Fatalf("resolveRoomID failed: %v", err)
 			}
@@ -126,7 +143,6 @@ func TestBiliBili_Extract_WithFormat(t *testing.T) {
 				t.Fatal("Extract returned nil result")
 			}
 
-			// Verify the URL suffix matches the expected format.
 			urlStr := result.URL
 			if len(urlStr) < len(tt.expectSuffix) {
 				t.Errorf("URL %q too short, expected suffix %q", urlStr, tt.expectSuffix)
@@ -134,11 +150,105 @@ func TestBiliBili_Extract_WithFormat(t *testing.T) {
 				t.Errorf("expected URL ending with %q, got %q", tt.expectSuffix, urlStr)
 			}
 
-			// Verify Referer header is set.
 			if got := result.Headers.Get("Referer"); got != "https://live.bilibili.com" {
 				t.Errorf("expected Referer https://live.bilibili.com, got %q", got)
 			}
 		})
+	}
+}
+
+func TestBiliBili_SetCookie(t *testing.T) {
+	l := &Link{rid: "12345", client: &http.Client{}}
+
+	// Verify Link implements CookieSetter
+	var _ extractor.CookieSetter = l
+
+	// Verify SetCookie wraps transport
+	originalTransport := l.client.Transport
+	l.SetCookie("SESSDATA=test123")
+	if l.cookie != "SESSDATA=test123" {
+		t.Errorf("expected cookie to be set, got %q", l.cookie)
+	}
+	if l.client.Transport == originalTransport {
+		t.Error("expected transport to be wrapped after SetCookie")
+	}
+
+	ct, ok := l.client.Transport.(*cookieTransport)
+	if !ok {
+		t.Fatal("expected transport to be cookieTransport")
+	}
+	if ct.cookie != "SESSDATA=test123" {
+		t.Errorf("expected cookieTransport cookie to be SESSDATA=test123, got %q", ct.cookie)
+	}
+}
+
+func TestBiliBili_SetCookie_Empty(t *testing.T) {
+	l := &Link{rid: "12345", client: &http.Client{}}
+	originalTransport := l.client.Transport
+	l.SetCookie("")
+	if l.cookie != "" {
+		t.Errorf("expected empty cookie, got %q", l.cookie)
+	}
+	// Empty cookie should NOT wrap transport
+	if l.client.Transport != originalTransport {
+		t.Error("expected transport to be unchanged when cookie is empty")
+	}
+}
+
+func TestCookieTransport_InjectsCookie(t *testing.T) {
+	var receivedCookie string
+	var receivedHost string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCookie = r.Header.Get("Cookie")
+		receivedHost = r.Host
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	ct := newCookieTransport(http.DefaultTransport, "SESSDATA=test; bili_jct=abc")
+	client := &http.Client{Transport: &rewriteBaseTransport{
+		base:    server.URL,
+		wrapped: ct,
+	}}
+
+	// Simulate a request to api.live.bilibili.com
+	req, _ := http.NewRequest("GET", "https://api.live.bilibili.com/test", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if receivedCookie != "SESSDATA=test; bili_jct=abc" {
+		t.Errorf("expected cookie to be injected, got %q", receivedCookie)
+	}
+	_ = receivedHost
+}
+
+func TestCookieTransport_SkipsNonBilibiliHost(t *testing.T) {
+	var receivedCookie string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCookie = r.Header.Get("Cookie")
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	ct := newCookieTransport(http.DefaultTransport, "SESSDATA=test")
+	client := &http.Client{Transport: &rewriteBaseTransport{
+		base:    server.URL,
+		wrapped: ct,
+	}}
+
+	// Simulate a request to a CDN host
+	req, _ := http.NewRequest("GET", "https://cdn.bilivideo.com/live/stream.flv", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if receivedCookie != "" {
+		t.Errorf("expected no cookie for non-bilibili host, got %q", receivedCookie)
 	}
 }
 
@@ -149,7 +259,6 @@ type rewriteBaseTransport struct {
 }
 
 func (t *rewriteBaseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Replace the scheme+host with the test server, keep the path and query.
 	newURL := t.base + req.URL.Path
 	if req.URL.RawQuery != "" {
 		newURL += "?" + req.URL.RawQuery
@@ -159,6 +268,7 @@ func (t *rewriteBaseTransport) RoundTrip(req *http.Request) (*http.Response, err
 		return nil, err
 	}
 	newReq.Header = req.Header
+	newReq.Host = req.Host
 	return t.wrapped.RoundTrip(newReq)
 }
 
@@ -174,55 +284,30 @@ func TestSelectStreamURL(t *testing.T) {
 		{
 			name:   "FLV format selection",
 			format: "flv",
-			info: &playInfoResponse{
-				Code: 0,
-				Data: struct {
-					RoomID      int `json:"room_id"`
-					LiveStatus  int `json:"live_status"`
-					PlayURLInfo struct {
-						PlayURL struct {
-							CID     int          `json:"cid"`
-							QnDesc  []qnDescItem `json:"g_qn_desc"`
-							Streams []streamItem `json:"stream"`
-						} `json:"playurl"`
-					} `json:"playurl_info"`
-				}{
-					PlayURLInfo: struct {
-						PlayURL struct {
-							CID     int          `json:"cid"`
-							QnDesc  []qnDescItem `json:"g_qn_desc"`
-							Streams []streamItem `json:"stream"`
-						} `json:"playurl"`
-					}{
-						PlayURL: struct {
-							CID     int          `json:"cid"`
-							QnDesc  []qnDescItem `json:"g_qn_desc"`
-							Streams []streamItem `json:"stream"`
-						}{
-							Streams: []streamItem{
-								{
-									ProtocolName: "http_stream",
-									Formats: []formatItem{
-										{
-											FormatName: "flv",
-											Codecs: []codecItem{
-												{
-													CodecName: "avc",
-													CurrentQn: 10000,
-													BaseURL:   "/live/flv/base/",
-													URLInfo: []urlItem{
-														{Host: "https://cdn1.example.com", Extra: "?key=abc"},
-													},
-												},
-											},
+			info: func() *playInfoResponse {
+				resp := &playInfoResponse{Code: 0}
+				resp.Data.PlayURLInfo.PlayURL.Streams = []streamItem{
+					{
+						ProtocolName: "http_stream",
+						Formats: []formatItem{
+							{
+								FormatName: "flv",
+								Codecs: []codecItem{
+									{
+										CodecName: "avc",
+										CurrentQn: 10000,
+										BaseURL:   "/live/flv/base/",
+										URLInfo: []urlItem{
+											{Host: "https://cdn1.example.com", Extra: "?key=abc"},
 										},
 									},
 								},
 							},
 						},
 					},
-				},
-			},
+				}
+				return resp
+			}(),
 			expectErr: false,
 			expectURL: "https://cdn1.example.com/live/flv/base/?key=abc",
 		},

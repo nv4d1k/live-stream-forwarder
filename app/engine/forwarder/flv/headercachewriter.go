@@ -62,12 +62,12 @@ func (w *HeaderCacheWriter) Write(p []byte) (int, error) {
 		w.buf = nil
 		return len(p), err
 	default:
-		// Header detected: cache it, write remaining media data.
+		// Header detected: cache it, write all buffered data to pipe (header is NOT stripped).
 		log.WithField("headerSize", offset).Debug("FLV header detected and cached")
 		entry := w.cache.GetOrCreate(w.key)
 		entry.Set(w.buf[:offset])
 		w.state = statePassthrough
-		_, err := w.next.Write(w.buf[offset:])
+		_, err := w.next.Write(w.buf)
 		w.buf = nil
 		return len(p), err
 	}

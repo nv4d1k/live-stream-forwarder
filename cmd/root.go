@@ -26,10 +26,11 @@ import (
 )
 
 var (
-	listenAddress string
-	listenPort    int
-	proxy         string
-	logFile       string
+	listenAddress  string
+	listenPort     int
+	proxy          string
+	bilibiliCookie string
+	logFile        string
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -68,9 +69,19 @@ var rootCmd = &cobra.Command{
 			if p != "" {
 				ctx.Set("proxy", p)
 			}
+			if bilibiliCookie != "" {
+				ctx.Set("bilibili-cookie", bilibiliCookie)
+			}
+			// Per-request ?cookie= (gzip+base64url encoded) overrides CLI --bilibili-cookie.
+			if c := ctx.DefaultQuery("cookie", ""); c != "" {
+				if raw, err := controllers.DecodeCookie(c); err == nil {
+					ctx.Set("bilibili-cookie", raw)
+				}
+			}
 			ctx.Next()
 		})
 		r.Use(ginlogrus.Logger(global.Log), gin.Recovery())
+		r.GET("/tools/cookie", controllers.CookieTool)
 		r.GET("/:platform/:room", controllers.Forwarder)
 		if global.LogLevel >= 6 {
 			controllers.Debug(r.Group("/debug"))
@@ -100,8 +111,8 @@ func Execute() {
 func init() {
 	cobra.OnInitialize(initConfig)
 	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
+	// Cobra supports persistent flags, which if defined here,
+	// will be global for the application.
 
 	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.live-stream-forwarder.yaml)")
 
@@ -122,6 +133,7 @@ func init() {
 		return 0
 	}(), "listen port")
 	rootCmd.PersistentFlags().StringVar(&proxy, "proxy", "", "proxy url")
+	rootCmd.PersistentFlags().StringVar(&bilibiliCookie, "bilibili-cookie", "", "raw cookie string for BiliBili authenticated streams")
 	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", "", "logging file")
 	rootCmd.PersistentFlags().Uint32Var(&global.LogLevel, "log-level", 3, "log level (0 - 6, 3 = warn , 5 = debug)")
 

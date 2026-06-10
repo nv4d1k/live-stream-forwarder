@@ -9,54 +9,45 @@ import (
 )
 
 // FLVStream wraps a *stream.Stream and prepends the cached FLV header
-// before live stream data. New clients connecting mid-stream will receive
-// the cached header first, then media data from the pipe.
+// before live stream data for mid-stream clients. If the cache has no
+// header yet, data passes through directly from the inner stream
+// (which already includes the FLV header from HeaderCacheWriter).
 type FLVStream struct {
-	inner      *stream.Stream
-	cache      *HeaderCache
-	key        string
-	headerBuf  *bytes.Reader
-	headerSent bool
+	inner     *stream.Stream
+	cache     *HeaderCache
+	key       string
+	headerBuf io.Reader
 }
 
 func NewFLVStream(inner *stream.Stream, cache *HeaderCache, key string) *FLVStream {
 	log := global.Log.WithField("func", "app.engine.forwarder.flv.NewFLVStream")
 	log.WithField("key", key).Debug("creating FLVStream")
-	return &FLVStream{
+	f := &FLVStream{
 		inner: inner,
 		cache: cache,
 		key:   key,
 	}
+	// If a cached header already exists, prepare it for prepending.
+	// This handles mid-stream clients that connect after the header
+	// has already passed through the pipe.
+	if entry := cache.GetOrCreate(key); entry.IsReady() {
+		if data := entry.Data(); data != nil {
+			f.headerBuf = bytes.NewReader(data)
+		}
+	}
+	return f
 }
 
 func (f *FLVStream) Read(p []byte) (int, error) {
-	log := global.Log.WithField("func", "app.engine.forwarder.flv.Read")
-	if !f.headerSent {
-		if f.headerBuf == nil {
-			entry := f.cache.GetOrCreate(f.key)
-			entry.Wait()
-			data := entry.Data()
-			if data != nil {
-				f.headerBuf = bytes.NewReader(data)
-			} else {
-				log.Warn("cached header is nil, falling back to inner stream")
-				f.headerSent = true
-				return f.inner.Read(p)
-			}
-		}
-
+	// If we have a cached header to prepend, send it first.
+	if f.headerBuf != nil {
 		n, err := f.headerBuf.Read(p)
 		if err == io.EOF {
 			f.headerBuf = nil
-			f.headerSent = true
 			return f.inner.Read(p)
-		}
-		if err != nil {
-			log.WithError(err).Warn("error reading cached header")
 		}
 		return n, err
 	}
-
 	return f.inner.Read(p)
 }
 

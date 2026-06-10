@@ -26,6 +26,7 @@ func init() {
 type Link struct {
 	rid    string
 	client *http.Client
+	cookie string
 }
 
 func NewBiliBiliLink(rid string, proxy *url.URL) (*Link, error) {
@@ -66,4 +67,13 @@ func (l *Link) SupportedFormats() []string {
 
 func (l *Link) DefaultFormat() string {
 	return "flv"
+}
+
+func (l *Link) SetCookie(rawCookie string) {
+	log := global.Log.WithField("func", "app.engine.extractor.BiliBili.SetCookie")
+	l.cookie = rawCookie
+	if rawCookie != "" {
+		l.client.Transport = newCookieTransport(l.client.Transport, rawCookie)
+		log.Debugln("cookie transport configured")
+	}
 }

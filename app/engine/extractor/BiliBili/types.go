@@ -53,14 +53,3 @@ type urlItem struct {
 	Host  string `json:"host"`
 	Extra string `json:"extra"`
 }
-
-type playURLV1Response struct {
-	Code int `json:"code"`
-	Data struct {
-		CurrentQn int `json:"current_qn"`
-		Durl      []struct {
-			URL   string `json:"url"`
-			Order int    `json:"order"`
-		} `json:"durl"`
-	} `json:"data"`
-}

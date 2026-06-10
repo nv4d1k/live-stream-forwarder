@@ -80,6 +80,16 @@ func (e *HeaderEntry) Wait() {
 	<-e.ready
 }
 
+// IsReady returns whether the header data is available without blocking.
+func (e *HeaderEntry) IsReady() bool {
+	select {
+	case <-e.ready:
+		return true
+	default:
+		return false
+	}
+}
+
 // Data returns the cached header data. Caller should call Wait first to ensure
 // data is available.
 func (e *HeaderEntry) Data() []byte {

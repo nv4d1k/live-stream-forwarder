@@ -31,6 +31,12 @@ type Extractor interface {
 	DefaultFormat() string
 }
 
+// CookieSetter is an optional interface that extractors can implement to
+// receive a raw cookie string for authenticated API requests.
+type CookieSetter interface {
+	SetCookie(rawCookie string)
+}
+
 // Factory creates an Extractor for a given room ID and optional proxy.
 type Factory func(rid string, proxy *url.URL) (Extractor, error)
 

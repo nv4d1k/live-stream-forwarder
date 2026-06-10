@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cookie Encoder</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #333; }
+h2 { margin-bottom: 1rem; }
+label { display: block; margin: 1rem 0 0.3rem; font-weight: 500; }
+textarea, input[type="text"], select { width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 0.9rem; }
+textarea { min-height: 80px; resize: vertical; }
+input[readonly] { background: #f5f5f5; cursor: text; }
+button { margin-top: 0.8rem; padding: 0.5rem 1.5rem; border: none; border-radius: 4px; background: #4a90d9; color: #fff; font-size: 1rem; cursor: pointer; }
+button:hover { background: #3a7bc8; }
+.hint { font-size: 0.85rem; color: #888; margin-top: 0.2rem; }
+.error { color: #e74c3c; margin-top: 0.3rem; }
+#result { display: none; }
+.row { display: flex; gap: 0.5rem; }
+.row > * { flex: 1; }
+</style>
+</head>
+<body>
+<h2>Cookie Encoder</h2>
+<p class="hint">Encode raw cookie strings into URL-safe query parameters for stream URLs.</p>
+<label for="raw">Raw Cookie</label>
+<textarea id="raw" placeholder="SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx"></textarea>
+<label for="platform">Platform</label>
+<div class="row">
+  <select id="platform">
+    <option value="bilibili">BiliBili</option>
+    <option value="kick">Kick</option>
+  </select>
+  <input type="text" id="roomId" placeholder="Room ID">
+</div>
+<button onclick="encode()">Encode</button>
+<div id="result">
+  <label for="encoded">Encoded Cookie</label>
+  <input type="text" id="encoded" readonly onclick="this.select()">
+  <label for="streamUrl">Stream URL</label>
+  <input type="text" id="streamUrl" readonly onclick="this.select()">
+  <label for="decoded">Verify Decode</label>
+  <input type="text" id="decoded" readonly onclick="this.select()">
+</div>
+<p id="errorMsg" class="error"></p>
+<script>
+function base64urlEncode(bytes) {
+  var binary = '';
+  bytes.forEach(function(b) { binary += String.fromCharCode(b); });
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64urlDecode(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  var binary = atob(str);
+  var bytes = new Uint8Array(binary.length);
+  for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function gzipCompress(text) {
+  var blob = new Blob([text]);
+  var cs = new CompressionStream('gzip');
+  var compressed = blob.stream().pipeThrough(cs);
+  return new Uint8Array(await new Response(compressed).arrayBuffer());
+}
+
+async function gzipDecompress(data) {
+  var blob = new Blob([data]);
+  var ds = new DecompressionStream('gzip');
+  var decompressed = blob.stream().pipeThrough(ds);
+  return new TextDecoder().decode(await new Response(decompressed).arrayBuffer());
+}
+
+async function encode() {
+  var raw = document.getElementById('raw').value.trim();
+  var errorMsg = document.getElementById('errorMsg');
+  errorMsg.textContent = '';
+  if (!raw) {
+    errorMsg.textContent = 'Please paste your cookie first';
+    return;
+  }
+  try {
+    var compressed = await gzipCompress(raw);
+    var encoded = base64urlEncode(compressed);
+    var decoded = await gzipDecompress(base64urlDecode(encoded));
+    if (decoded !== raw) {
+      errorMsg.textContent = 'Round-trip verification failed';
+      return;
+    }
+    document.getElementById('encoded').value = encoded;
+    var platform = document.getElementById('platform').value;
+    var roomId = document.getElementById('roomId').value || 'ROOM_ID';
+    document.getElementById('streamUrl').value = location.protocol + '//' + location.host + '/' + platform + '/' + roomId + '?cookie=' + encoded;
+    document.getElementById('decoded').value = decoded;
+    document.getElementById('result').style.display = 'block';
+  } catch (e) {
+    errorMsg.textContent = 'Error: ' + e.message;
+  }
+}
+</script>
+</body>
+</html>
