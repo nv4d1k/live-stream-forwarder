@@ -22,8 +22,8 @@ jobs:
       - name: Run tests
         run: go test -cover -v ./...
 
-  # ── Build binaries & create GitHub Release ──────────────────────────
-  release:
+  # ── Build binaries per platform ─────────────────────────────────────
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -77,12 +77,27 @@ jobs:
             tar czf "${archive}.tar.gz" "${archive}"
           fi
 
-      - name: Upload release artifact
-        uses: softprops/action-gh-release@v3
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: lsf_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
             lsf_*.tar.gz
             lsf_*.zip
+
+  # ── Create GitHub Release (single job, no concurrency issues) ───────
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**
 
   # ── Build & push multi-arch Docker image ────────────────────────────
   docker:
