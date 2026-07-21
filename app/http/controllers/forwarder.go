@@ -8,6 +8,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 
@@ -182,37 +183,12 @@ func Forwarder(c *gin.Context) {
 	// 3. Resolve the desired format.
 	desiredFormat := resolveDesiredFormat(format, ext)
 
-	// 4. Build the unified extractFn closure.
-	var initialFormat string
-	extractFn := func(previous *stream.ExtractResult) (*stream.ExtractResult, error) {
-		extractFormat := desiredFormat
-		if previous != nil {
-			extractFormat = initialFormat
-		}
-		result, err := ext.Extract(extractFormat)
-		if err != nil {
-			return nil, fmt.Errorf("extract error: %w", err)
-		}
-		streamResult := &stream.ExtractResult{
-			URL:             result.URL,
-			Headers:         result.Headers,
-			ExpireAt:        result.ExpireAt,
-			VariantSelector: result.VariantSelector,
-		}
-		u, parseErr := url.Parse(result.URL)
-		if parseErr != nil {
-			return nil, fmt.Errorf("parse extracted URL error: %w", parseErr)
-		}
-		if previous != nil {
-			newFmt := formatFromURL(u)
-			if newFmt != initialFormat {
-				return nil, fmt.Errorf("format changed from %s to %s, will retry", initialFormat, newFmt)
-			}
-		} else {
-			initialFormat = formatFromURL(u)
-		}
-		return streamResult, nil
-	}
+	// 4. Build the unified extractFn closure. The first extraction (previous
+	// ==nil) is cached inside buildExtractFn so that dispatch routing and the
+	// chosen forwarder reuse it instead of hitting the upstream extractor
+	// twice (DouYu/Twitch would otherwise be called once for routing and
+	// again by the forwarder's produce loop).
+	extractFn := buildExtractFn(ext, desiredFormat)
 
 	// 5. Perform initial extraction.
 	result, err := extractFn(nil)
@@ -226,4 +202,72 @@ func Forwarder(c *gin.Context) {
 	u, _ := url.Parse(result.URL)
 	key := fmt.Sprintf("%s:%s", platform, room)
 	dispatchStream(c, u, extractFn, proxyURL, entry.Mobile, key)
+}
+
+// buildExtractFn wraps an extractor in an ExtractFunc that enforces format
+// consistency on retry and caches the first extraction.
+//
+// The first call (previous==nil) extracts with desiredFormat, caches the
+// result, and records the resolved initial format; subsequent nil calls
+// return the cached result without re-invoking the extractor. This lets the
+// dispatch routing decision (which needs the URL to pick a forwarder) and the
+// chosen forwarder's produce loop share a single upstream call instead of each
+// extracting separately (which would double DouYu/Twitch API hits).
+//
+// On retry (previous!=nil) it re-extracts fresh using the initial format and
+// rejects URLs whose format differs, so a stream never switches between
+// FLV/HLS/WebSocket mid-flight.
+func buildExtractFn(ext extractor.Extractor, desiredFormat string) stream.ExtractFunc {
+	var (
+		initialFormat string
+		initOnce      sync.Once
+		initResult    *stream.ExtractResult
+		initErr       error
+	)
+	// doExtract performs a fresh extraction and returns the wrapped result
+	// together with the format derived from the URL.
+	doExtract := func(format string) (*stream.ExtractResult, string, error) {
+		result, err := ext.Extract(format)
+		if err != nil {
+			return nil, "", fmt.Errorf("extract error: %w", err)
+		}
+		streamResult := &stream.ExtractResult{
+			URL:             result.URL,
+			Headers:         result.Headers,
+			ExpireAt:        result.ExpireAt,
+			VariantSelector: result.VariantSelector,
+		}
+		u, parseErr := url.Parse(result.URL)
+		if parseErr != nil {
+			return nil, "", fmt.Errorf("parse extracted URL error: %w", parseErr)
+		}
+		return streamResult, formatFromURL(u), nil
+	}
+	return func(previous *stream.ExtractResult) (*stream.ExtractResult, error) {
+		if previous == nil {
+			// First extraction: cache so dispatch + forwarder reuse one call.
+			initOnce.Do(func() {
+				r, fmtName, err := doExtract(desiredFormat)
+				if err != nil {
+					initErr = err
+					return
+				}
+				initResult = r
+				initialFormat = fmtName
+			})
+			if initErr != nil {
+				return nil, initErr
+			}
+			return initResult, nil
+		}
+		// Retry: re-extract fresh using the initial format and validate.
+		r, fmtName, err := doExtract(initialFormat)
+		if err != nil {
+			return nil, err
+		}
+		if fmtName != initialFormat {
+			return nil, fmt.Errorf("format changed from %s to %s, will retry", initialFormat, fmtName)
+		}
+		return r, nil
+	}
 }
