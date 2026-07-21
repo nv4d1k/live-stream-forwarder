@@ -112,7 +112,31 @@ func TestIsRetriableWS(t *testing.T) {
 	}
 }
 
-// TestReadLoopNilConnDoesNotPanic verifies that ReadLoop returns cleanly when
+// TestFrontendResponseHeader verifies the hijacked HTTP/1.1 response header is
+// compatible with HTTP/2 reverse proxies. Sending "Transfer-Encoding:
+// identity" made Caddy return 502 to HTTP/2 clients because HTTP/2 has no
+// Transfer-Encoding concept. The body must be close-delimited (Connection:
+// close, no Content-Length) so an indefinite live stream can be proxied.
+func TestFrontendResponseHeader(t *testing.T) {
+	h := frontendResponseHeader()
+	s := string(h)
+
+	if !strings.HasPrefix(s, "HTTP/1.1 200 OK\r\n") {
+		t.Errorf("expected response to start with 200 OK, got %q", s)
+	}
+	if strings.Contains(s, "Transfer-Encoding:") {
+		t.Errorf("response must not contain Transfer-Encoding (HTTP/2 incompatible), got: %q", s)
+	}
+	if !strings.Contains(s, "Content-Type: video/x-flv\r\n") {
+		t.Errorf("expected Content-Type: video/x-flv, got %q", s)
+	}
+	if !strings.Contains(s, "Connection: close\r\n") {
+		t.Errorf("expected Connection: close for close-delimited body, got %q", s)
+	}
+	if strings.Contains(s, "Content-Length:") {
+		t.Errorf("response must not set Content-Length (indefinite stream), got %q", s)
+	}
+} // TestReadLoopNilConnDoesNotPanic verifies that ReadLoop returns cleanly when
 // the underlying conn is nil instead of dereferencing a nil pointer. This is
 // the direct regression for the panic observed when Close() races with
 // ReadLoop and zeroes c.conn.

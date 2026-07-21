@@ -54,6 +54,29 @@ func (s *WebSocketForwarder) httpHeader() http.Header {
 	return h
 }
 
+// frontendResponseHeader builds the HTTP/1.1 response header sent to the
+// downstream client after hijacking the connection. The body is the live FLV
+// stream, framed as a close-delimited body (no Content-Length).
+//
+// Note: "Transfer-Encoding: identity" is deliberately NOT sent. HTTP/2 has no
+// notion of Transfer-Encoding (it is a hop-by-hop HTTP/1.1 construct), so a
+// reverse proxy that speaks HTTP/2 to the client (e.g. Caddy) fails to
+// translate an "identity"-encoded HTTP/1.1 upstream and returns 502. A
+// close-delimited body (Connection: close, no Content-Length) is the
+// standard, proxy-friendly way to stream an indefinite response.
+func frontendResponseHeader() []byte {
+	buffer := bytes.NewBuffer(nil)
+	buffer.WriteString("HTTP/1.1 200 OK\r\n")
+	buffer.WriteString("Content-Type: video/x-flv\r\n")
+	buffer.WriteString("Connection: close\r\n")
+	buffer.WriteString("Cache-Control: no-cache\r\n")
+	buffer.WriteString("Access-Control-Allow-Origin: *\r\n")
+	buffer.WriteString("Access-Control-Allow-Headers: *\r\n")
+	buffer.WriteString("Access-Control-Allow-Methods: *\r\n")
+	buffer.WriteString("\r\n")
+	return buffer.Bytes()
+}
+
 func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.WebSocketForwarder.Start")
 	log.WithField("field", "backend url").Debug(u)
@@ -87,19 +110,7 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 		}
 		return err
 	}
-	buffer := bytes.NewBuffer(nil)
-	buffer.WriteString("HTTP/1.1 200 OK\r\n")
-	buffer.WriteString("Content-Type: video/x-flv\r\n")
-	buffer.WriteString("Transfer-Encoding: identity\r\n")
-	buffer.WriteString("Connection: close\r\n")
-	buffer.WriteString("Cache-Control: no-cache\r\n")
-	buffer.WriteString("Access-Control-Allow-Origin: *\r\n")
-	buffer.WriteString("Access-Control-Allow-Headers: *\r\n")
-	buffer.WriteString("Access-Control-Allow-Methods: *\r\n")
-	buffer.WriteString("\r\n")
-
-	_, err = conn.Write(buffer.Bytes())
-	if err != nil {
+	if _, err := conn.Write(frontendResponseHeader()); err != nil {
 		log.WithError(err).Errorln("write frontend error")
 		return err
 	}

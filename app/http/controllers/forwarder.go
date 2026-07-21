@@ -34,7 +34,6 @@ import (
 // even if the producer reconnects on 403.
 func streamToClient(c *gin.Context, r io.ReadCloser, contentType string) {
 	c.Writer.Header().Set("Content-Type", contentType)
-	c.Writer.Header().Set("Transfer-Encoding", "identity")
 	c.Writer.Header().Set("Connection", "close")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
