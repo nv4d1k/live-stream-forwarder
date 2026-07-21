@@ -2,9 +2,15 @@ package websocket
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
+	ws "github.com/gorilla/websocket"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/sirupsen/logrus"
 )
@@ -104,4 +110,75 @@ func TestIsRetriableWS(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReadLoopNilConnDoesNotPanic verifies that ReadLoop returns cleanly when
+// the underlying conn is nil instead of dereferencing a nil pointer. This is
+// the direct regression for the panic observed when Close() races with
+// ReadLoop and zeroes c.conn.
+func TestReadLoopNilConnDoesNotPanic(t *testing.T) {
+	c := &client{pipe: stream.NewPipe()}
+	panicked := make(chan interface{}, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked <- r
+				return
+			}
+			close(panicked)
+		}()
+		c.ReadLoop()
+	}()
+	select {
+	case r, ok := <-panicked:
+		if ok && r != nil {
+			t.Fatalf("ReadLoop panicked on nil conn: %v", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadLoop did not return within timeout")
+	}
+}
+
+// TestClientConcurrentCloseNoRace drives a real ws round trip and closes the
+// client while ReadLoop is running. Under -race the unprotected c.conn access
+// must not be flagged and ReadLoop must not panic.
+func TestClientConcurrentCloseNoRace(t *testing.T) {
+	up := ws.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := c.WriteMessage(ws.BinaryMessage, []byte("payload")); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	u := "ws" + strings.TrimPrefix(srv.URL, "http")
+	cl := NewXP2PClient(u, nil, nil)
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cl.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := cl.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Give ReadLoop time to observe the closed connection and exit.
+	time.Sleep(50 * time.Millisecond)
 }

@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,11 +12,16 @@ import (
 	"sync"
 	"time"
 
+	ws "github.com/gorilla/websocket"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
-	ws "github.com/gorilla/websocket"
 )
+
+// errClientClosed is returned by DialContext when Close has already been
+// invoked, so ReadLoop's reconnect path can tell an intentional shutdown apart
+// from an upstream failure.
+var errClientClosed = errors.New("websocket client closed")
 
 func NewXP2PClient(u string, header http.Header, proxy *url.URL) Background {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewXP2PClient")
@@ -113,7 +119,7 @@ type client struct {
 	header       http.Header
 	dialer       *ws.Dialer
 	conn         *ws.Conn
-	stopCh       chan struct{}
+	closed       bool // set by Close; ReadLoop checks it to avoid reconnecting after a client disconnect
 	pipe         *stream.Pipe
 	extractFn    stream.ExtractFunc
 	previous     *stream.ExtractResult
@@ -148,6 +154,9 @@ func (c *client) DialContext(ctx context.Context) error {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.DialContext")
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return errClientClosed
+	}
 
 	conn, resp, err := c.dialer.DialContext(ctx, c.url, c.header)
 	if err != nil {
@@ -172,6 +181,10 @@ func (c *client) Close() error {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.Close")
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
 	if c.conn == nil {
 		return nil
 	}
@@ -181,21 +194,46 @@ func (c *client) Close() error {
 	return err
 }
 
+// isClosed reports whether Close has been called. ReadLoop uses it to stop
+// reconnecting once the downstream client has disconnected.
+func (c *client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
 func (c *client) ReadLoop() {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.ReadLoop")
 	for {
-		mt, body, err := c.conn.ReadMessage()
+		// Snapshot conn under the lock: Close() may zero c.conn concurrently,
+		// and reading it here without the lock was the source of both a
+		// nil-pointer panic (Close races ReadLoop) and a data race on c.conn.
+		c.mu.Lock()
+		conn := c.conn
+		closed := c.closed
+		c.mu.Unlock()
+		if closed || conn == nil {
+			return
+		}
+		mt, body, err := conn.ReadMessage()
 		if err != nil {
+			// Close() may have fired while we were blocked in ReadMessage; if
+			// so the downstream client is gone and we must not reconnect.
+			if c.isClosed() {
+				c.pipe.CloseWithError(err)
+				return
+			}
 			if c.extractFn != nil && isRetriableWS(err) {
 				log.Warnf("retriable websocket error: %s, reconnecting...", err.Error())
-				c.conn.Close()
+				// Close the stale conn before re-dialing a fresh one.
+				conn.Close()
 				result, extractErr := c.extractFn(c.previous)
 				if extractErr != nil {
 					log.Errorf("extract for reconnect error: %s", extractErr.Error())
 					c.pipe.CloseWithError(err)
 					return
 				}
-				// Validate that the re-extracted URL is still a websocket URL
+				// Validate that the re-extracted URL is still a websocket URL.
 				if !isWebSocketURL(result.URL) {
 					log.Warnf("extract returned non-websocket URL: %s, retrying", result.URL)
 					c.pipe.CloseWithError(fmt.Errorf("extract returned non-websocket URL on retry"))
@@ -205,21 +243,14 @@ func (c *client) ReadLoop() {
 				c.previous = result
 				// Reset header writer so the new stream's header is re-detected.
 				c.headerWriter = nil
-				c.mu.Lock()
-				conn, resp, dialErr := c.dialer.DialContext(context.TODO(), c.url, c.header)
-				c.mu.Unlock()
+				ctx, cancel := context.WithTimeout(context.TODO(), 15*time.Second)
+				dialErr := c.DialContext(ctx)
+				cancel()
 				if dialErr != nil {
 					log.Errorf("reconnect dial error: %s", dialErr.Error())
 					c.pipe.CloseWithError(dialErr)
 					return
 				}
-				if resp.StatusCode != http.StatusSwitchingProtocols {
-					c.pipe.CloseWithError(fmt.Errorf("reconnect dial err: %s", resp.Status))
-					return
-				}
-				c.mu.Lock()
-				c.conn = conn
-				c.mu.Unlock()
 				continue
 			}
 			c.pipe.CloseWithError(err)
