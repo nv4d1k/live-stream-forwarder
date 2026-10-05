@@ -97,7 +97,8 @@ Available formats by platform:
 ## Features
 
 - **Seamless 403 recovery**: When an upstream stream URL expires (HTTP 403), the forwarder automatically re-extracts a fresh URL and reconnects — the player never sees a break.
-- **Proactive token refresh**: For platforms with expiring URLs (e.g. Kick's JWT-signed playback URL), the HLS forwarder proactively re-extracts before the token expires, avoiding playback interruptions entirely.
+- **Stall watchdogs**: Upstream nodes sometimes stop pushing data while keeping the connection open (e.g. DouYu's xp2p edges after token expiry). Two watchdogs catch this — one for silent connections, one for streams whose data never reaches the client — and reconnect automatically. Long sessions also self-heal expired platform credentials.
+- **Proactive token refresh**: For platforms with expiring URLs (e.g. Kick's JWT-signed playback URL, DouYu's 5-minute ws tokens), the HLS and WebSocket forwarders proactively re-extract before the token expires, avoiding playback interruptions entirely.
 - **Best quality by default**: HLS streams automatically select the highest bandwidth variant. BiliBili uses the v1 API first for higher quality before falling back to v2.
 - **FLV header caching**: Late-joining clients receive a cached FLV header before live data, enabling mid-stream connections without player errors.
 - **No re-encoding**: Streams are forwarded as-is, keeping latency minimal.

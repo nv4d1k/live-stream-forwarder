@@ -4,12 +4,15 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 func TestMain(m *testing.M) {
@@ -105,6 +108,222 @@ func TestDouYu_CalcAuth(t *testing.T) {
 			t.Errorf("auth contains non-hex character: %c", c)
 			break
 		}
+	}
+}
+
+// TestExpireAtFromURL verifies expiry parsing from stream URLs. DouYu ws URLs
+// carry a relative "expire" query (seconds) and tx CDN URLs carry an absolute
+// hex "txTime" Unix timestamp; when both exist the earlier one wins.
+func TestExpireAtFromURL(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name    string
+		rawURL  string
+		want    bool
+		aboutIn time.Duration // expected ExpireAt distance from now (for want=true)
+	}{
+		{
+			name:    "relative expire seconds",
+			rawURL:  "wss://edge.example.com/a.b.c/live/stream.xs?wsAuth=abc&expire=300",
+			want:    true,
+			aboutIn: 300 * time.Second,
+		},
+		{
+			name:    "absolute hex txTime",
+			rawURL:  "https://cdn.example.com/live/stream.flv?txSecret=s&txTime=6ac40c47",
+			want:    true,
+			aboutIn: time.Unix(0x6ac40c47, 0).Sub(now),
+		},
+		{
+			name:    "both expire and far txTime picks expire",
+			rawURL:  "wss://edge.example.com/live/stream.xs?expire=300&txSecret=s&txTime=6ac40c47",
+			want:    true,
+			aboutIn: 300 * time.Second,
+		},
+		{
+			name:   "no expiry params",
+			rawURL: "https://cdn.example.com/live/stream.flv?token=abc",
+			want:   false,
+		},
+		{
+			name:   "invalid expire value",
+			rawURL: "wss://edge.example.com/live/stream.xs?expire=abc",
+			want:   false,
+		},
+		{
+			name:   "invalid txTime value",
+			rawURL: "wss://edge.example.com/live/stream.xs?txTime=zzz",
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := url.Parse(tt.rawURL)
+			if err != nil {
+				t.Fatalf("parse url: %v", err)
+			}
+			got := expireAtFromURL(u)
+			if !tt.want {
+				if got != nil {
+					t.Errorf("expireAtFromURL() = %v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("expireAtFromURL() = nil, want a time")
+			}
+			want := now.Add(tt.aboutIn)
+			if diff := got.Sub(want); diff < -2*time.Second || diff > 2*time.Second {
+				t.Errorf("expireAtFromURL() = %v, want about %v (diff %s)", got, want, diff)
+			}
+		})
+	}
+}
+
+// TestGetLinkRateStreamError verifies GetLink surfaces API errors instead of
+// building a URL from empty fields (e.g. after the broadcaster goes offline).
+func TestGetLinkRateStreamError(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "api error with message",
+			body: `{"error":104,"msg":"room is closed","data":{}}`,
+		},
+		{
+			name: "missing rtmp fields",
+			body: `{"error":0,"data":{"p2p":0}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l := &Link{rid: "123", rateStreamFn: func() (gjson.Result, error) {
+				return gjson.Parse(tt.body), nil
+			}}
+			u, err := l.GetLink("flv")
+			if err == nil {
+				t.Fatalf("GetLink() = %v, want error for body %q", u, tt.body)
+			}
+		})
+	}
+}
+
+// TestRateStreamErrorPlainText verifies plain-text API rejections (the API
+// answers a bare "鉴权失败" string when the enc_data credentials expire)
+// surface their actual reason instead of a misleading offline message.
+func TestRateStreamErrorPlainText(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "auth failure text", body: `"鉴权失败"`, want: "鉴权失败"},
+		{name: "empty response", body: `""`, want: "empty rate stream response"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rateStreamError(gjson.Parse(tt.body)); got != tt.want {
+				t.Errorf("rateStreamError(%s) = %q, want %q", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetLinkAuthFailureRetriesWithFreshEncData verifies that an expired
+// enc_data (rejected with 鉴权失败 after ~10 minutes) triggers a credential
+// refresh and a retry, so long-running streams keep refreshing their URL.
+func TestGetLinkAuthFailureRetriesWithFreshEncData(t *testing.T) {
+	goodRateStream := `{
+		"error": 0,
+		"data": {
+			"p2p": 10,
+			"rtmp_url": "https://dummy",
+			"rtmp_live": "streamname.flv?wsAuth=abc&expire=300",
+			"p2pMeta": {
+				"dyxp2p_sug_egde": "edge.example.com",
+				"dyxp2p_domain": "example.domain",
+				"xp2p_txDelay": "5000",
+				"xp2p_txSecret": "secret",
+				"xp2p_txTime": "6ac40c47"
+			}
+		}
+	}`
+	var rateCalls, encRefreshes int
+	l := &Link{
+		rid:     "123",
+		did:     "testdid",
+		encData: `{"key":"oldkey","rand_str":"oldrand","enc_time":1,"enc_data":"oldenc"}`,
+		rateStreamFn: func() (gjson.Result, error) {
+			rateCalls++
+			if rateCalls == 1 {
+				// Expired credentials: the API answers a bare string.
+				return gjson.Parse(`"鉴权失败"`), nil
+			}
+			return gjson.Parse(goodRateStream), nil
+		},
+		encryptDataFn: func() (string, error) {
+			encRefreshes++
+			return `{"key":"newkey","rand_str":"newrand","enc_time":0,"enc_data":"newenc"}`, nil
+		},
+	}
+
+	u, err := l.GetLink("ws")
+	if err != nil {
+		t.Fatalf("GetLink() error: %v", err)
+	}
+	if u.Scheme != "wss" {
+		t.Errorf("GetLink() scheme = %q, want wss", u.Scheme)
+	}
+	if rateCalls != 2 {
+		t.Errorf("rate stream requested %d times, want 2 (original + retry)", rateCalls)
+	}
+	if encRefreshes != 1 {
+		t.Errorf("enc data refreshed %d times, want 1", encRefreshes)
+	}
+}
+
+// TestExtract_SetsExpireAtFromP2PURL runs a full p2p=10 (WebSocket) rate
+// stream response through Extract and verifies the returned Result carries
+// an ExpireAt derived from the expire query parameter.
+func TestExtract_SetsExpireAtFromP2PURL(t *testing.T) {
+	rateStream := `{
+		"error": 0,
+		"data": {
+			"p2p": 10,
+			"rtmp_url": "https://dummy",
+			"rtmp_live": "streamname.flv?wsAuth=abc&expire=300",
+			"p2pMeta": {
+				"dyxp2p_sug_egde": "edge.example.com",
+				"dyxp2p_domain": "example.domain",
+				"xp2p_txDelay": "5000",
+				"xp2p_txSecret": "secret",
+				"xp2p_txTime": "6ac40c47"
+			}
+		}
+	}`
+	l := &Link{rid: "123", rateStreamFn: func() (gjson.Result, error) {
+		return gjson.Parse(rateStream), nil
+	}}
+
+	result, err := l.Extract("ws")
+	if err != nil {
+		t.Fatalf("Extract() error: %v", err)
+	}
+	u, err := url.Parse(result.URL)
+	if err != nil {
+		t.Fatalf("parse extracted url: %v", err)
+	}
+	if u.Scheme != "wss" {
+		t.Errorf("extracted scheme = %q, want wss", u.Scheme)
+	}
+	if result.ExpireAt == nil {
+		t.Fatal("Extract() returned nil ExpireAt, want expiry from expire=300")
+	}
+	if diff := time.Until(*result.ExpireAt) - 300*time.Second; diff < -2*time.Second || diff > 2*time.Second {
+		t.Errorf("ExpireAt = %v, want about now+300s (diff %s)", result.ExpireAt, diff)
 	}
 }
 

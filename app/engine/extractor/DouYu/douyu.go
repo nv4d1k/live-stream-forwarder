@@ -10,6 +10,7 @@ import (
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/global"
+	"github.com/tidwall/gjson"
 )
 
 func init() {
@@ -36,6 +37,12 @@ type Link struct {
 	res          string
 	streamParams streamParameters
 	proxy        *url.URL
+
+	// rateStreamFn overrides a single getH5PlayV1 request; injected in tests.
+	rateStreamFn func() (gjson.Result, error)
+	// encryptDataFn overrides getEncryptData for credential refresh; injected
+	// in tests.
+	encryptDataFn func() (string, error)
 
 	client *http.Client
 }
@@ -86,7 +93,12 @@ func (l *Link) Extract(format string) (*extractor.Result, error) {
 		return nil, err
 	}
 	log.WithField("url", u.String()).Infoln("stream URL extracted")
-	return &extractor.Result{URL: u.String()}, nil
+	result := &extractor.Result{URL: u.String()}
+	result.ExpireAt = expireAtFromURL(u)
+	if result.ExpireAt != nil {
+		log.WithField("field", "expire at").Debugf("url expires at %s", result.ExpireAt.Format(time.RFC3339))
+	}
+	return result, nil
 }
 
 func (l *Link) SupportedFormats() []string {

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,4 +206,426 @@ func TestClientConcurrentCloseNoRace(t *testing.T) {
 	}
 	// Give ReadLoop time to observe the closed connection and exit.
 	time.Sleep(50 * time.Millisecond)
+}
+
+// stallServer is a ws test server whose first connection delivers a few
+// messages and then goes silent without closing (the exact failure mode of
+// DouYu xp2p edge nodes after token expiry). Subsequent connections stream
+// "late" payloads on a ticker.
+type stallServer struct {
+	*httptest.Server
+	conns atomic.Int32
+}
+
+func newStallServer(t *testing.T) *stallServer {
+	t.Helper()
+	up := ws.Upgrader{}
+	s := &stallServer{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		if s.conns.Add(1) == 1 {
+			// First connection: a few messages, then silence forever.
+			for i := 0; i < 3; i++ {
+				if err := c.WriteMessage(ws.BinaryMessage, []byte("early")); err != nil {
+					return
+				}
+			}
+			select {} // hang: keep the connection open but send nothing
+		}
+		defer c.Close()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := c.WriteMessage(ws.BinaryMessage, []byte("late")); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func wsURL(srv *httptest.Server) string {
+	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+// readUntil reads from the client until the accumulated output contains want
+// or the timeout elapses. It returns what was read.
+func readUntil(t *testing.T, c *client, want string, timeout time.Duration) (string, error) {
+	t.Helper()
+	deadline := time.After(timeout)
+	var sb strings.Builder
+	buf := make([]byte, 4096)
+	for {
+		type res struct {
+			n   int
+			err error
+		}
+		ch := make(chan res, 1)
+		go func() {
+			n, err := c.Read(buf)
+			ch <- res{n, err}
+		}()
+		select {
+		case <-deadline:
+			return sb.String(), errors.New("timeout waiting for " + want)
+		case r := <-ch:
+			if r.err != nil {
+				return sb.String(), r.err
+			}
+			sb.Write(buf[:r.n])
+			if strings.Contains(sb.String(), want) {
+				return sb.String(), nil
+			}
+		}
+	}
+}
+
+// TestReadLoopWatchdogReconnectsOnStall is the regression for the DouYu
+// xp2p stall: the edge node stops pushing data but keeps the connection
+// open. Without a read deadline, ReadMessage blocks forever and the client
+// sees an idle stream. The watchdog must trip and reconnect transparently.
+func TestReadLoopWatchdogReconnectsOnStall(t *testing.T) {
+	srv := newStallServer(t)
+	url := wsURL(srv.Server)
+
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		return &stream.ExtractResult{URL: url}, nil
+	}, nil, nil, "").(*client)
+	cl.watchdog = 150 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	out, err := readUntil(t, cl, "late", 3*time.Second)
+	if err != nil {
+		t.Fatalf("client did not recover after stall: %v (got %q)", err, out)
+	}
+	if got := srv.conns.Load(); got < 2 {
+		t.Errorf("server saw %d connections, want >= 2 (watchdog should reconnect)", got)
+	}
+	if !strings.Contains(out, "early") {
+		t.Errorf("expected initial payload before the stall, got %q", out)
+	}
+}
+
+// TestReadLoopRefreshesBeforeExpiry verifies a URL with ExpireAt set is
+// re-extracted and reconnected before it expires, even while data is still
+// flowing (so the watchdog alone would not fire).
+func TestReadLoopRefreshesBeforeExpiry(t *testing.T) {
+	up := ws.Upgrader{}
+	var conns atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conns.Add(1)
+		defer c.Close()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			payload := strings.Repeat("x", 4096) // keep data flowing; watchdog stays fed
+			if err := c.WriteMessage(ws.BinaryMessage, []byte(payload)); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	url := wsURL(srv)
+
+	expireAt := time.Now().Add(400 * time.Millisecond)
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		e := expireAt
+		return &stream.ExtractResult{URL: url, ExpireAt: &e}, nil
+	}, nil, nil, "").(*client)
+	cl.watchdog = 30 * time.Second // watchdog disabled for this test
+	cl.refreshLead = 200 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// The refresh point is now+200ms; the URL expires at now+400ms. A second
+	// connection must appear well before expiry without the stream stalling.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if conns.Load() >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no proactive refresh: server saw %d connections in 2s", conns.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Data must still flow after the reconnect.
+	if _, err := readUntil(t, cl, "xxxx", time.Second); err != nil {
+		t.Errorf("stream broken after proactive refresh: %v", err)
+	}
+}
+
+// TestReconnectGivesUpAfterMaxFails verifies that when re-extraction keeps
+// failing (e.g. the room went offline), the client stops retrying after the
+// configured number of attempts and closes the pipe instead of spinning.
+func TestReconnectGivesUpAfterMaxFails(t *testing.T) {
+	up := ws.Upgrader{}
+	var conns atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := up.Upgrade(w, r, nil); err != nil {
+			return
+		}
+		conns.Add(1)
+		// Accept but never send anything: trips the watchdog.
+		select {}
+	}))
+	defer srv.Close()
+	url := wsURL(srv)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		if calls.Add(1) == 1 {
+			return &stream.ExtractResult{URL: url}, nil
+		}
+		return nil, errors.New("room is closed")
+	}, nil, nil, "").(*client)
+	cl.watchdog = 100 * time.Millisecond
+	cl.backoffs = []time.Duration{1 * time.Millisecond}
+	cl.maxReconnectFails = 3
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	buf := make([]byte, 16)
+	done := make(chan error, 1)
+	go func() {
+		_, err := cl.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("pipe closed without error after giving up")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pipe never closed after reconnect attempts were exhausted")
+	}
+	if got := calls.Load(); got != 4 { // 1 initial + 3 failed retries
+		t.Errorf("extractFn called %d times, want 4", got)
+	}
+}
+
+// TestReadLoopReconnectsOn403 keeps the original 403-driven reconnect path
+// covered: a re-dial that hits a 403 is retried with backoff and the stream
+// recovers once a good URL comes back.
+func TestReadLoopReconnectsOn403(t *testing.T) {
+	up := ws.Upgrader{}
+	var conns atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/blocked" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		if conns.Add(1) == 1 {
+			// First connection delivers data then closes with a 403 close error.
+			c.WriteMessage(ws.BinaryMessage, []byte("first"))
+			c.WriteControl(ws.CloseMessage,
+				ws.FormatCloseMessage(403, "forbidden"),
+				time.Now().Add(time.Second))
+			c.Close()
+			return
+		}
+		defer c.Close()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := c.WriteMessage(ws.BinaryMessage, []byte("recovered")); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	base := wsURL(srv)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		n := calls.Add(1)
+		if n == 2 {
+			return &stream.ExtractResult{URL: base + "/blocked"}, nil
+		}
+		return &stream.ExtractResult{URL: base}, nil
+	}, nil, nil, "").(*client)
+	cl.watchdog = 5 * time.Second
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	out, err := readUntil(t, cl, "recovered", 3*time.Second)
+	if err != nil {
+		t.Fatalf("stream did not recover after 403: %v (got %q)", err, out)
+	}
+	if got := calls.Load(); got < 3 {
+		t.Errorf("extractFn called %d times, want >= 3 (403 must be retried)", got)
+	}
+}
+
+func TestIsTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "plain error", err: errors.New("connection reset"), want: false},
+		{name: "deadline exceeded", err: os.ErrDeadlineExceeded, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTimeout(tt.err); got != tt.want {
+				t.Errorf("isTimeout(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// flvMediaChunk is a self-contained FLV header plus one media (non-config)
+// audio tag. HeaderCacheWriter flushes it through to the pipe, so the client
+// records a pipe write.
+func flvMediaChunk() []byte {
+	// FLV signature (3) + version (1) + flags (1) + header size (4) = 9 bytes.
+	header := []byte("FLV\x01\x00\x00\x00\x00\x09")
+	prevTagSize0 := []byte{0, 0, 0, 0}
+	// Audio tag: type 0x08, dataSize 1, payload 0x00 (raw PCM — not a config tag).
+	tagHeader := []byte{0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	tagData := []byte{0x00}
+	prevTagSize := []byte{0, 0, 0, 0x0f}
+	return append(append(append(append(header, prevTagSize0...), tagHeader...), tagData...), prevTagSize...)
+}
+
+// flvDribbleChunk starts an FLV header plus a video tag header that declares
+// a ~4KB payload, then trickles 2-byte fragments forever without ever
+// completing the tag. HeaderCacheWriter keeps buffering this (detect state
+// never resolves), so nothing reaches the pipe even though ws messages keep
+// arriving — the "fake-alive" stream that a message-level watchdog cannot
+// catch.
+func flvDribbleStart() []byte {
+	header := []byte("FLV\x01\x00\x00\x00\x00\x09")
+	prevTagSize0 := []byte{0, 0, 0, 0}
+	// Video tag header: type 0x09, dataSize 0x000F42 (3906 bytes of payload).
+	tagHeader := []byte{0x09, 0x00, 0x0f, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	return append(append(header, prevTagSize0...), tagHeader...)
+}
+
+// TestReadLoopPipeStallWatchdog is the regression for the fake-alive stream:
+// a connection whose ws messages keep arriving but whose data never reaches
+// the pipe (an in-progress giant FLV tag that dribbles in forever). The
+// message-level watchdog stays fed; only a pipe-write-level watchdog notices.
+func TestReadLoopPipeStallWatchdog(t *testing.T) {
+	up := ws.Upgrader{}
+	var conns atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		switch conns.Add(1) {
+		case 1:
+			// Healthy connection: real media data flows, then silence.
+			c.WriteMessage(ws.BinaryMessage, flvMediaChunk())
+			select {}
+		case 2:
+			// Fake-alive connection: giant tag dribbles 2 bytes every 20ms,
+			// ws messages keep coming but nothing ever reaches the pipe.
+			c.WriteMessage(ws.BinaryMessage, flvDribbleStart())
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := c.WriteMessage(ws.BinaryMessage, []byte{0x00, 0x00}); err != nil {
+					return
+				}
+			}
+		default:
+			defer c.Close()
+			// Healthy again.
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := c.WriteMessage(ws.BinaryMessage, flvMediaChunk()); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+	url := wsURL(srv)
+
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		return &stream.ExtractResult{URL: url}, nil
+	}, nil, nil, "test:pipe-stall").(*client)
+	// Message-level watchdog is generous: the dribbling messages keep it fed.
+	cl.watchdog = 30 * time.Second
+	cl.pipeWatchdog = 300 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// The client must cycle past the fake-alive connection and recover on
+	// the third one; the pipe stall (300ms) drives the reconnects, not the
+	// 30s message watchdog.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if conns.Load() >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fake-alive connection not replaced: server saw %d connections in 5s", conns.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Data must flow again: read enough bytes to prove the third connection
+	// flushed through the pipe.
+	if _, err := readUntil(t, cl, "FLV", 2*time.Second); err != nil {
+		t.Errorf("stream broken after pipe-stall reconnect: %v", err)
+	}
+}
+
+// TestReadDeadlinePipeStall verifies the deadline computation itself: once a
+// pipe write has happened, the read deadline is capped by the pipe watchdog
+// even when the message watchdog would allow much longer.
+func TestReadDeadlinePipeStall(t *testing.T) {
+	cl := &client{pipe: stream.NewPipe()}
+	cl.watchdog = 30 * time.Second
+	cl.pipeWatchdog = 5 * time.Second
+
+	// No pipe write yet: deadline is the message watchdog.
+	d := cl.readDeadline()
+	if got := time.Until(d); got < 25*time.Second || got > 30*time.Second {
+		t.Errorf("readDeadline() = %v from now, want ~30s (message watchdog)", got)
+	}
+
+	// After a pipe write: deadline is capped by the pipe watchdog.
+	cl.markPipeWrite()
+	d = cl.readDeadline()
+	if got := time.Until(d); got < 4*time.Second || got > 5*time.Second {
+		t.Errorf("readDeadline() = %v from now, want ~5s (pipe watchdog)", got)
+	}
 }

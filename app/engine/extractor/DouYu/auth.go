@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/tidwall/gjson"
@@ -87,8 +89,62 @@ func (l *Link) calculateAuth() (auth string, err error) {
 	return auth, nil
 }
 
+// getRateStream calls the getH5PlayV1 API once and, when the request is
+// rejected, refreshes the encryption credentials and retries once. The
+// enc_data returned by getEncryption embeds an expire_at about 10 minutes
+// out, so re-extractions minutes after creation fail with "鉴权失败" unless
+// the credentials are renewed.
 func (l *Link) getRateStream() (gjson.Result, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.DouYu.getRateStream")
+	data, err := l.doRateStreamRequest()
+	if err != nil {
+		return gjson.Result{}, err
+	}
+	if msg := rateStreamError(data); msg != "" {
+		log.WithField("field", "rate stream error").Warnf("rate stream api rejected request: %s, refreshing credentials", msg)
+		if encErr := l.refreshEncData(); encErr != nil {
+			return gjson.Result{}, fmt.Errorf("refresh enc data error after %q: %w", msg, encErr)
+		}
+		data, err = l.doRateStreamRequest()
+		if err != nil {
+			return gjson.Result{}, err
+		}
+	}
+	return data, nil
+}
+
+// refreshEncData renews the encryption data used to build the auth chain.
+func (l *Link) refreshEncData() error {
+	log := global.Log.WithField("func", "app.engine.extractor.DouYu.refreshEncData")
+	if l.encryptDataFn != nil {
+		enc, err := l.encryptDataFn()
+		if err != nil {
+			return err
+		}
+		l.encData = enc
+		return nil
+	}
+	enc, err := l.getEncryptData()
+	if err != nil {
+		log.WithError(err).Warnln("failed to refresh encrypt data")
+		return err
+	}
+	l.encData = enc
+	log.Infoln("encrypt data refreshed")
+	return nil
+}
+
+// doRateStreamRequest performs a single getH5PlayV1 POST with a fresh
+// timestamp and returns the parsed response.
+func (l *Link) doRateStreamRequest() (gjson.Result, error) {
+	log := global.Log.WithField("func", "app.engine.extractor.DouYu.doRateStreamRequest")
+	if l.rateStreamFn != nil {
+		return l.rateStreamFn()
+	}
+	// Refresh the timestamp on every call: the API rejects auth derived from
+	// a tt older than its time window ("时间戳错误"), which used to break
+	// re-extractions several minutes after the extractor was created.
+	l.t10 = strconv.Itoa(int(time.Now().Unix()))
 	auth, err := l.calculateAuth()
 	if err != nil {
 		return gjson.Result{}, fmt.Errorf("calculate auth error for get rate stream: %w", err)

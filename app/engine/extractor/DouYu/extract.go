@@ -28,6 +28,12 @@ func (l *Link) GetLink(_ string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get rate stream error: %w", err)
 	}
+	// Surface API-level errors (room closed, auth expired, ...) instead of
+	// building a broken URL from empty fields.
+	if msg := rateStreamError(data); msg != "" {
+		log.WithField("field", "rate stream error").Warnf("rate stream api rejected request: %s", msg)
+		return nil, fmt.Errorf("rate stream api error: %s", msg)
+	}
 	streamID := strings.Split(filepath.Base(data.Get("data.rtmp_live").String()), ".")[0]
 	uuid := uuidgen.NewV4()
 	s := rand.New(rand.NewSource(time.Now().Unix()))
