@@ -224,6 +224,21 @@ func (c *client) pipeStalled() bool {
 	return time.Since(last) > c.pipeWatchdogDuration()
 }
 
+// refreshDue reports whether the current URL has reached its proactive
+// refresh point (ExpireAt - refreshLead) and should be replaced with a fresh
+// one. Like pipeStalled, this is a positive check: the read deadline cannot
+// enforce the handover while ws messages keep arriving, because once the
+// absolute refresh point has slipped into the past every message re-arms a
+// rolling minReadDeadline window — the swap would silently degrade into a
+// post-expiry stall. ReadLoop therefore tests this explicitly after every
+// message.
+func (c *client) refreshDue() bool {
+	if c.previous == nil || c.previous.ExpireAt == nil {
+		return false
+	}
+	return time.Now().After(c.previous.ExpireAt.Add(-c.refreshLeadDuration()))
+}
+
 // refreshLeadDuration returns the effective proactive-refresh lead time.
 func (c *client) refreshLeadDuration() time.Duration {
 	if c.refreshLead > 0 {
@@ -372,6 +387,20 @@ func (c *client) ReadLoop() {
 				return
 			}
 			c.pipe.CloseWithError(err)
+			return
+		}
+
+		// Positive refresh check: swap in a fresh URL at the proactive
+		// refresh point even while data is still flowing, so the handover
+		// happens without a client-visible break. The read deadline cannot
+		// enforce this on its own once the absolute refresh point has slipped
+		// into the past — every message re-arms a rolling fallback window.
+		if c.refreshDue() {
+			log.Info("proactive refresh point reached, swapping in a fresh URL")
+			if c.reconnect() {
+				continue
+			}
+			// reconnect() closed the pipe (client gone or retries exhausted).
 			return
 		}
 
