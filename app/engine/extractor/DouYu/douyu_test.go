@@ -135,8 +135,10 @@ func TestExpireAtFromURL(t *testing.T) {
 			aboutIn: time.Unix(0x6ac40c47, 0).Sub(now),
 		},
 		{
-			name:    "both expire and far txTime picks expire",
-			rawURL:  "wss://edge.example.com/live/stream.xs?expire=300&txSecret=s&txTime=6ac40c47",
+			name: "both expire and far txTime picks expire",
+			// txTime must be generated dynamically (far in the future) so the
+			// test never rots once the hardcoded instant has passed.
+			rawURL:  fmt.Sprintf("wss://edge.example.com/live/stream.xs?expire=300&txSecret=s&txTime=%x", time.Now().Add(6*time.Hour).Unix()),
 			want:    true,
 			aboutIn: 300 * time.Second,
 		},
@@ -289,7 +291,9 @@ func TestGetLinkAuthFailureRetriesWithFreshEncData(t *testing.T) {
 // stream response through Extract and verifies the returned Result carries
 // an ExpireAt derived from the expire query parameter.
 func TestExtract_SetsExpireAtFromP2PURL(t *testing.T) {
-	rateStream := `{
+	// txTime must be generated dynamically (far in the future) so the test
+	// never rots once the hardcoded instant has passed.
+	rateStream := fmt.Sprintf(`{
 		"error": 0,
 		"data": {
 			"p2p": 10,
@@ -300,10 +304,10 @@ func TestExtract_SetsExpireAtFromP2PURL(t *testing.T) {
 				"dyxp2p_domain": "example.domain",
 				"xp2p_txDelay": "5000",
 				"xp2p_txSecret": "secret",
-				"xp2p_txTime": "6ac40c47"
+				"xp2p_txTime": "%x"
 			}
 		}
-	}`
+	}`, time.Now().Add(6*time.Hour).Unix())
 	l := &Link{rid: "123", rateStreamFn: func() (gjson.Result, error) {
 		return gjson.Parse(rateStream), nil
 	}}
