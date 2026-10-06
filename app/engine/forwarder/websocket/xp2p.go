@@ -208,6 +208,22 @@ func (c *client) lastPipeWrite() time.Time {
 	return time.Time{}
 }
 
+// pipeStalled reports whether the pipe has gone longer than the pipe
+// watchdog without receiving data. It is a positive check for "fake alive"
+// upstreams: the read deadline alone cannot fire while ws messages keep
+// arriving, because once the absolute pipe deadline (lastPipeWrite +
+// pipeWatchdog) has slipped into the past, every message re-arms a fresh
+// rolling minReadDeadline window. ReadLoop therefore tests this explicitly
+// after every message and reconnects instead of waiting out a deadline
+// that will never trip.
+func (c *client) pipeStalled() bool {
+	last := c.lastPipeWrite()
+	if last.IsZero() {
+		return false
+	}
+	return time.Since(last) > c.pipeWatchdogDuration()
+}
+
 // refreshLeadDuration returns the effective proactive-refresh lead time.
 func (c *client) refreshLeadDuration() time.Duration {
 	if c.refreshLead > 0 {
@@ -356,6 +372,19 @@ func (c *client) ReadLoop() {
 				return
 			}
 			c.pipe.CloseWithError(err)
+			return
+		}
+
+		// Positive pipe-stall check: the message arrived, but if nothing has
+		// reached the pipe within the pipe watchdog window the connection is
+		// fake alive — reconnect now rather than waiting for the read
+		// deadline, which cannot trip while messages keep it fed.
+		if c.pipeStalled() {
+			log.Warn("pipe stall detected: messages keep arriving but no data reaches the pipe, reconnecting...")
+			if c.reconnect() {
+				continue
+			}
+			// reconnect() closed the pipe (client gone or retries exhausted).
 			return
 		}
 		switch mt {
