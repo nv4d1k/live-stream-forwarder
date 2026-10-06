@@ -14,9 +14,12 @@ const (
 	statePassthrough
 )
 
-// HeaderCacheWriter intercepts writes to detect and cache FLV header/config tags,
-// then strips them from the output. Once all config tags are detected, subsequent
-// writes pass through directly to the underlying writer.
+// HeaderCacheWriter intercepts writes to detect and cache FLV header/config
+// tags, then strips them from the output so the pipe carries media data
+// only. Consumers (FLVStream, WebSocketForwarder) prepend the cached header
+// themselves, so every client stream starts with exactly one header,
+// including across upstream reconnects. Once all config tags are detected,
+// subsequent writes pass through directly to the underlying writer.
 type HeaderCacheWriter struct {
 	next  io.Writer
 	cache *HeaderCache
@@ -55,19 +58,23 @@ func (w *HeaderCacheWriter) Write(p []byte) (int, error) {
 		// Not enough data yet, buffer and wait.
 		return len(p), nil
 	case offset == 0:
-		// Not valid FLV or no header detected; passthrough everything.
-		log.Debug("no FLV header detected, switching to passthrough mode")
+		// Not valid FLV: resolve the cache entry as missing so consumers
+		// waiting for a header stop waiting, then passthrough everything.
+		log.WithField("key", w.key).Warn("upstream is not valid FLV, header cache entry marked missing")
+		w.cache.GetOrCreate(w.key).SetMissing()
 		w.state = statePassthrough
 		_, err := w.next.Write(w.buf)
 		w.buf = nil
 		return len(p), err
 	default:
-		// Header detected: cache it, write all buffered data to pipe (header is NOT stripped).
-		log.WithField("headerSize", offset).Debug("FLV header detected and cached")
+		// Header detected: cache it and strip it from the output. The pipe
+		// carries media data only; consumers prepend the cached header
+		// themselves so the header appears exactly once per client stream.
+		log.WithField("headerSize", offset).Debug("FLV header detected, cached and stripped")
 		entry := w.cache.GetOrCreate(w.key)
 		entry.Set(w.buf[:offset])
 		w.state = statePassthrough
-		_, err := w.next.Write(w.buf)
+		_, err := w.next.Write(w.buf[offset:])
 		w.buf = nil
 		return len(p), err
 	}

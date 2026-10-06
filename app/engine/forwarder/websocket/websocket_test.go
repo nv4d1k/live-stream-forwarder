@@ -284,6 +284,36 @@ func readUntil(t *testing.T, c *client, want string, timeout time.Duration) (str
 	}
 }
 
+// readBytes reads from the client until n bytes accumulate or the timeout
+// elapses. It returns what was read.
+func readBytes(t *testing.T, c *client, n int, timeout time.Duration) ([]byte, error) {
+	t.Helper()
+	deadline := time.After(timeout)
+	var out []byte
+	for len(out) < n {
+		type res struct {
+			data []byte
+			err  error
+		}
+		ch := make(chan res, 1)
+		go func() {
+			buf := make([]byte, 4096)
+			rn, err := c.Read(buf)
+			ch <- res{buf[:rn], err}
+		}()
+		select {
+		case <-deadline:
+			return out, errors.New("timeout reading bytes")
+		case r := <-ch:
+			if r.err != nil {
+				return out, r.err
+			}
+			out = append(out, r.data...)
+		}
+	}
+	return out, nil
+}
+
 // TestReadLoopWatchdogReconnectsOnStall is the regression for the DouYu
 // xp2p stall: the edge node stops pushing data but keeps the connection
 // open. Without a read deadline, ReadMessage blocks forever and the client
@@ -504,9 +534,23 @@ func TestIsTimeout(t *testing.T) {
 	}
 }
 
+// flvMediaTag is the media (non-config) audio tag carried inside
+// flvMediaChunk — the part that keeps flowing once the FLV header has
+// passed. A real upstream sends the header exactly once per connection and
+// continues with media-only messages.
+func flvMediaTag() []byte {
+	return []byte{
+		0x08, 0x00, 0x00, 0x01, // tag type 8 (audio), data size 1
+		0x00, 0x00, 0x00, 0x00, // timestamp
+		0x00, 0x00, 0x00, // stream id
+		0x00,                   // tag data
+		0x00, 0x00, 0x00, 0x0f, // previous tag size
+	}
+}
+
 // flvMediaChunk is a self-contained FLV header plus one media (non-config)
-// audio tag. HeaderCacheWriter flushes it through to the pipe, so the client
-// records a pipe write.
+// audio tag. HeaderCacheWriter caches and strips the header and flushes the
+// media tag through to the pipe, so the client records a pipe write.
 func flvMediaChunk() []byte {
 	// FLV signature (3) + version (1) + flags (1) + header size (4) = 9 bytes.
 	header := []byte("FLV\x01\x00\x00\x00\x00\x09")
@@ -602,9 +646,72 @@ func TestReadLoopPipeStallWatchdog(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	// Data must flow again: read enough bytes to prove the third connection
-	// flushed through the pipe.
-	if _, err := readUntil(t, cl, "FLV", 2*time.Second); err != nil {
+	// flushed through the pipe. The marker is the media tag header — the FLV
+	// signature itself no longer reaches the pipe once headers are stripped.
+	if _, err := readUntil(t, cl, "\x08\x00\x00\x01", 2*time.Second); err != nil {
 		t.Errorf("stream broken after pipe-stall reconnect: %v", err)
+	}
+}
+
+// TestReadLoopReconnectStripsHeader is the regression test for the ws-path
+// header splice: reconnect() resets the header writer, and the fresh
+// connection restarts with a complete FLV stream — header included. The new
+// header must be cached and stripped, because the downstream client already
+// got the header from the cache; a second FLV signature in the pipe would
+// desync demuxers mid-stream.
+func TestReadLoopReconnectStripsHeader(t *testing.T) {
+	up := ws.Upgrader{}
+	var conns atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		switch conns.Add(1) {
+		case 1:
+			// First connection: one complete FLV chunk, then silence — the
+			// pipe watchdog declares it stalled and reconnects.
+			c.WriteMessage(ws.BinaryMessage, flvMediaChunk())
+			select {}
+		default:
+			// Reconnected: like a fresh upstream connection, the stream
+			// restarts with a complete FLV chunk (header + media tag), then
+			// continues with media-only messages.
+			if err := c.WriteMessage(ws.BinaryMessage, flvMediaChunk()); err != nil {
+				return
+			}
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := c.WriteMessage(ws.BinaryMessage, flvMediaTag()); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+	url := wsURL(srv)
+
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		return &stream.ExtractResult{URL: url}, nil
+	}, nil, nil, "test:reconnect-strip").(*client)
+	cl.watchdog = 30 * time.Second
+	cl.pipeWatchdog = 300 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Read well past the first connection's single chunk (16 media bytes) so
+	// the assertion covers data delivered by the reconnected stream.
+	out, err := readBytes(t, cl, 64, 3*time.Second)
+	if err != nil || len(out) < 64 {
+		t.Fatalf("stream broken after reconnect: %v (got %d bytes)", err, len(out))
+	}
+	if got := strings.Count(string(out), "FLV"); got != 0 {
+		t.Errorf("pipe output contains %d FLV signatures, want 0 (reconnected stream's header must be stripped)", got)
 	}
 }
 

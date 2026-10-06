@@ -2,10 +2,12 @@ package flv
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
@@ -189,7 +191,8 @@ func TestHeaderCacheWriter_DetectHeaderBoundary(t *testing.T) {
 		expectedBoundary := len(fullData)
 		fullData = append(fullData, videoTag...)
 
-		w := NewHeaderCacheWriter(io.Discard, cache, "test:valid")
+		var out bytes.Buffer
+		w := NewHeaderCacheWriter(&out, cache, "test:valid")
 		n, err := w.Write(fullData)
 		if err != nil {
 			t.Fatalf("Write returned error: %v", err)
@@ -205,6 +208,13 @@ func TestHeaderCacheWriter_DetectHeaderBoundary(t *testing.T) {
 		if len(data) != expectedBoundary {
 			t.Fatalf("cached header length = %d, want %d", len(data), expectedBoundary)
 		}
+
+		// The header must be stripped from the output: only the media tag
+		// reaches the pipe. Consumers prepend the cached header themselves,
+		// so leaving it in would duplicate it for every warm-cache client.
+		if !bytes.Equal(out.Bytes(), videoTag) {
+			t.Fatalf("pipe output = %v, want media tag only = %v", out.Bytes(), videoTag)
+		}
 	})
 
 	t.Run("invalid data", func(t *testing.T) {
@@ -218,6 +228,16 @@ func TestHeaderCacheWriter_DetectHeaderBoundary(t *testing.T) {
 		}
 		if n != len(invalidData) {
 			t.Fatalf("Write returned %d, want %d", n, len(invalidData))
+		}
+
+		// The cache entry must be resolved as missing so consumers waiting
+		// for a header stop waiting instead of hanging forever.
+		entry := cache2.GetOrCreate("test:invalid")
+		if !entry.IsReady() {
+			t.Fatal("non-FLV passthrough should resolve the cache entry as missing")
+		}
+		if entry.Data() != nil {
+			t.Fatalf("Data() = %v, want nil after non-FLV passthrough", entry.Data())
 		}
 	})
 
@@ -325,4 +345,222 @@ func TestFLVStream_ReadWithHeader(t *testing.T) {
 	// Close() here would panic with "close of closed channel". We skip
 	// cleanup — the goroutine will exit on its own after the pipe error
 	// propagates. This test only validates the Read (header + live) behavior.
+}
+
+func TestHeaderEntry_SetMissingWaitTimeout(t *testing.T) {
+	e := newHeaderEntry()
+
+	if e.IsReady() {
+		t.Fatal("fresh entry should not be ready")
+	}
+	if e.WaitTimeout(10 * time.Millisecond) {
+		t.Fatal("WaitTimeout should time out on an unresolved entry")
+	}
+
+	e.SetMissing()
+	if !e.IsReady() {
+		t.Fatal("SetMissing should resolve the entry")
+	}
+	if e.Data() != nil {
+		t.Fatalf("Data() = %v, want nil after SetMissing", e.Data())
+	}
+	if !e.WaitTimeout(time.Second) {
+		t.Fatal("WaitTimeout should return immediately on a resolved entry")
+	}
+
+	// A later Set recovers the entry with data (e.g. a reconnect delivers a
+	// valid FLV stream after a garbage response).
+	e.Set([]byte{0x01, 0x02, 0x03})
+	if !bytes.Equal(e.Data(), []byte{0x01, 0x02, 0x03}) {
+		t.Fatalf("Data() = %v, want the data from the recovering Set", e.Data())
+	}
+}
+
+// buildFLVStream builds a complete synthetic FLV stream: file header,
+// config tags (script data, AAC sequence header, AVC sequence header), then
+// mediaCount raw AAC audio tags. It returns the full stream and the header
+// (everything up to and including the last config tag) — the part
+// HeaderCacheWriter is expected to cache and strip.
+func buildFLVStream(mediaCount int) (full, header []byte) {
+	flvHeader := []byte{'F', 'L', 'V', 0x01, 0x05, 0x00, 0x00, 0x00, 0x09}
+	prevTagSize0 := []byte{0x00, 0x00, 0x00, 0x00}
+	scriptTag := buildFLVTag(0x12, []byte{0x02, 0x00})
+	audioSeqTag := buildFLVTag(0x08, []byte{0xAF, 0x00}) // AAC sequence header (config)
+	videoSeqTag := buildFLVTag(0x09, []byte{0x17, 0x00}) // AVC keyframe sequence header (config)
+
+	header = append(append(append(append(append([]byte{}, flvHeader...), prevTagSize0...), scriptTag...), audioSeqTag...), videoSeqTag...)
+	full = append([]byte(nil), header...)
+	for i := 0; i < mediaCount; i++ {
+		full = append(full, buildFLVTag(0x08, []byte{0xAF, 0x01})...) // raw AAC frame (media)
+	}
+	return full, header
+}
+
+// stopFetchErr terminates the produce loop with a non-retriable error so
+// tests can read the stream to completion.
+var stopFetchErr = errors.New("stop test stream")
+
+// stopAfter returns a FetchFunc that serves the given payloads in order,
+// one per produce iteration, then fails with stopFetchErr.
+func stopAfter(payloads ...[]byte) stream.FetchFunc {
+	calls := 0
+	return func(u string, headers http.Header) (io.ReadCloser, error) {
+		if calls >= len(payloads) {
+			return nil, stopFetchErr
+		}
+		payload := payloads[calls]
+		calls++
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	}
+}
+
+// newTestFLVStream wires a full per-request FLV pipeline the same way
+// flvStreamWithCache does in the controller: a producer stream whose pipe is
+// wrapped by a HeaderCacheWriter, plus the FLVStream that prepends the
+// cached header.
+func newTestFLVStream(cache *HeaderCache, key string, fetchFn stream.FetchFunc) *FLVStream {
+	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		return &stream.ExtractResult{URL: "http://example.com/live.flv"}, nil
+	}
+	writerWrapper := func(w io.Writer) io.Writer {
+		return NewHeaderCacheWriter(w, cache, key)
+	}
+	inner := stream.NewStream(extractFn, fetchFn, stream.WithWriterWrapper(writerWrapper))
+	return NewFLVStream(inner, cache, key)
+}
+
+// TestFLVStream_ColdClientSingleHeader verifies the cold-cache path: the
+// client's own producer caches the header, and the client receives exactly
+// one header followed by the media data.
+func TestFLVStream_ColdClientSingleHeader(t *testing.T) {
+	cache := NewHeaderCache()
+	key := "test:cold"
+	full, _ := buildFLVStream(4)
+
+	f := newTestFLVStream(cache, key, stopAfter(full))
+	data, err := io.ReadAll(f)
+	if !errors.Is(err, stopFetchErr) {
+		t.Fatalf("ReadAll error = %v, want stopFetchErr", err)
+	}
+	if !bytes.Equal(data, full) {
+		t.Fatalf("client stream = %d bytes, want the single-header stream (%d bytes)", len(data), len(full))
+	}
+	if got := bytes.Count(data, []byte("FLV")); got != 1 {
+		t.Fatalf("client stream contains %d FLV signatures, want 1", got)
+	}
+}
+
+// TestFLVStream_WarmClientSingleHeader is the regression test for the
+// doubled-header bug: a client connecting while the header cache is warm
+// must receive the cached header exactly once, followed by the media data of
+// its own fresh upstream connection — whose own header must be stripped.
+// Before the fix, the new connection's header passed through the pipe
+// unstripped, so every client after the first received two overlapping FLV
+// headers, which desynced demuxers (PotPlayer refused to play, ffprobe
+// reported "Packet mismatch" with garbage tag sizes derived from the second
+// 'FLV' signature).
+func TestFLVStream_WarmClientSingleHeader(t *testing.T) {
+	cache := NewHeaderCache()
+	key := "test:warm"
+	_, header := buildFLVStream(0)
+	full2, _ := buildFLVStream(3)
+
+	// A previous client warmed the cache.
+	cache.GetOrCreate(key).Set(header)
+
+	f := newTestFLVStream(cache, key, stopAfter(full2))
+	data, err := io.ReadAll(f)
+	if !errors.Is(err, stopFetchErr) {
+		t.Fatalf("ReadAll error = %v, want stopFetchErr", err)
+	}
+	want := append(append([]byte{}, header...), full2[len(header):]...)
+	if !bytes.Equal(data, want) {
+		t.Fatalf("client stream = %d bytes, want cached header + new media (%d bytes)", len(data), len(want))
+	}
+	if got := bytes.Count(data, []byte("FLV")); got != 1 {
+		t.Fatalf("client stream contains %d FLV signatures, want 1", got)
+	}
+}
+
+// TestFLVStream_ReconnectStripsHeader is the regression test for the
+// mid-stream header splice: when the upstream connection is replaced
+// (403/expiry reconnect), the new connection delivers a complete FLV stream
+// again — header included. The header must be stripped so the client sees
+// continuous media data with no second FLV signature in the middle.
+func TestFLVStream_ReconnectStripsHeader(t *testing.T) {
+	cache := NewHeaderCache()
+	key := "test:reconnect"
+	full1, header := buildFLVStream(2)
+	full2, _ := buildFLVStream(3)
+
+	f := newTestFLVStream(cache, key, stopAfter(full1, full2))
+	data, err := io.ReadAll(f)
+	if !errors.Is(err, stopFetchErr) {
+		t.Fatalf("ReadAll error = %v, want stopFetchErr", err)
+	}
+	want := append(append([]byte{}, full1...), full2[len(header):]...)
+	if !bytes.Equal(data, want) {
+		t.Fatalf("client stream = %d bytes, want both connections' media with a single header (%d bytes)", len(data), len(want))
+	}
+	if got := bytes.Count(data, []byte("FLV")); got != 1 {
+		t.Fatalf("client stream contains %d FLV signatures, want 1", got)
+	}
+}
+
+// TestFLVStream_HeaderWaitTimeout verifies the safety net: when the header
+// never becomes available (e.g. the upstream stalls mid-detection), Read
+// gives up after HeaderWaitTimeout and passes the inner stream through
+// instead of hanging forever.
+func TestFLVStream_HeaderWaitTimeout(t *testing.T) {
+	old := HeaderWaitTimeout
+	HeaderWaitTimeout = 100 * time.Millisecond
+	defer func() { HeaderWaitTimeout = old }()
+
+	cache := NewHeaderCache()
+	key := "test:wait-timeout"
+	media := buildFLVTag(0x08, []byte{0xAF, 0x01})
+
+	// No writer wrapper: nothing ever populates the cache entry.
+	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		return &stream.ExtractResult{URL: "http://example.com/live.flv"}, nil
+	}
+	inner := stream.NewStream(extractFn, stopAfter(media))
+	f := NewFLVStream(inner, cache, key)
+
+	start := time.Now()
+	data, err := io.ReadAll(f)
+	elapsed := time.Since(start)
+	if !errors.Is(err, stopFetchErr) {
+		t.Fatalf("ReadAll error = %v, want stopFetchErr", err)
+	}
+	if elapsed < HeaderWaitTimeout {
+		t.Fatalf("ReadAll returned after %v, want at least the header wait timeout %v", elapsed, HeaderWaitTimeout)
+	}
+	if !bytes.Equal(data, media) {
+		t.Fatalf("client stream = %v, want the media data passed through", data)
+	}
+}
+
+// TestFLVStream_MissingHeaderPassthrough guards the first-play black screen
+// that c109f4f fixed: when the upstream is not valid FLV, the writer
+// resolves the cache entry as missing and the client must receive the raw
+// data immediately, without waiting for a header that will never come.
+func TestFLVStream_MissingHeaderPassthrough(t *testing.T) {
+	cache := NewHeaderCache()
+	key := "test:missing"
+	raw := []byte("not an flv stream, just raw upstream bytes")
+
+	f := newTestFLVStream(cache, key, stopAfter(raw))
+
+	start := time.Now()
+	data, err := io.ReadAll(f)
+	if !errors.Is(err, stopFetchErr) {
+		t.Fatalf("ReadAll error = %v, want stopFetchErr", err)
+	}
+	if !bytes.Equal(data, raw) {
+		t.Fatalf("client stream = %q, want raw passthrough %q", data, raw)
+	}
+	if elapsed := time.Since(start); elapsed >= HeaderWaitTimeout {
+		t.Fatalf("passthrough took %v, should not wait for the header timeout", elapsed)
+	}
 }

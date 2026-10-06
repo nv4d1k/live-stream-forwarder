@@ -115,11 +115,14 @@ func (s *WebSocketForwarder) Start(c *gin.Context, u string) error {
 		return err
 	}
 
-	// Send cached FLV header to the client if available.
+	// Send cached FLV header to the client if available. The pipe carries
+	// media data only (HeaderCacheWriter strips headers), so the header must
+	// come from the cache.
 	if s.cacheKey != "" {
 		entry := flv.DefaultCache.GetOrCreate(s.cacheKey)
-		entry.Wait()
-		if data := entry.Data(); data != nil {
+		if !entry.WaitTimeout(flv.HeaderWaitTimeout) {
+			log.WithField("field", "cache key").WithField("key", s.cacheKey).Warnf("timeout waiting for FLV header after %s, streaming without header", flv.HeaderWaitTimeout)
+		} else if data := entry.Data(); len(data) > 0 {
 			if _, writeErr := conn.Write(data); writeErr != nil {
 				log.WithError(writeErr).Errorln("write cached header error")
 				st.Close()

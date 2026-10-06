@@ -2,6 +2,7 @@ package flv
 
 import (
 	"sync"
+	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
@@ -22,6 +23,13 @@ type HeaderEntry struct {
 
 // DefaultCache is the process-wide FLV header cache.
 var DefaultCache = NewHeaderCache()
+
+// HeaderWaitTimeout bounds how long a consumer waits for a header cache
+// entry to resolve before falling back to streaming without a header. The
+// writer normally resolves the entry within one upstream round trip; this
+// is a safety net against upstreams that stall mid-detection. It is a var
+// so tests can shorten it.
+var HeaderWaitTimeout = 5 * time.Second
 
 func NewHeaderCache() *HeaderCache {
 	log := global.Log.WithField("func", "app.engine.forwarder.flv.NewHeaderCache")
@@ -78,6 +86,28 @@ func (e *HeaderEntry) Set(data []byte) {
 // Wait blocks until the header data is available (Set has been called at least once).
 func (e *HeaderEntry) Wait() {
 	<-e.ready
+}
+
+// WaitTimeout blocks until the entry is resolved (Set or SetMissing) or the
+// timeout elapses. It returns false on timeout.
+func (e *HeaderEntry) WaitTimeout(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-e.ready:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// SetMissing resolves the entry without a header — the upstream turned out
+// not to be valid FLV. It unblocks consumers waiting for a header so they
+// fall back to passing data through instead of hanging forever.
+func (e *HeaderEntry) SetMissing() {
+	log := global.Log.WithField("func", "app.engine.forwarder.flv.SetMissing")
+	e.once.Do(func() { close(e.ready) })
+	log.Debug("header cache entry resolved without header")
 }
 
 // IsReady returns whether the header data is available without blocking.
