@@ -59,14 +59,22 @@ func streamToClient(c *gin.Context, r io.ReadCloser, contentType string) {
 	}
 }
 
-// formatFromURL determines the stream format from a URL: "ws", "flv", "m3u8", etc.
+// formatFromURL determines the stream format from a URL: "ws", "flv",
+// "m3u8", etc. DouYu's p2p=2 ".xs" URLs serve the same http-flv payload as
+// ".flv", so they normalize to "flv" — dispatchStream already routes both to
+// the FLV forwarder, and treating them as one format lets a mid-stream
+// switch continue seamlessly instead of tripping the consistency check.
 func formatFromURL(u *url.URL) string {
 	switch u.Scheme {
 	case "ws", "wss":
 		return "ws"
-	default:
-		return strings.TrimPrefix(path.Ext(u.Path), ".")
 	}
+	if ext := path.Ext(u.Path); ext == ".xs" {
+		return "flv"
+	} else if ext != "" {
+		return strings.TrimPrefix(ext, ".")
+	}
+	return ""
 }
 
 // resolveDesiredFormat determines the desired stream format from the query
@@ -203,6 +211,13 @@ func Forwarder(c *gin.Context) {
 	dispatchStream(c, u, extractFn, proxyURL, entry.Mobile, key)
 }
 
+// formatDeadlockThreshold is how many consecutive format mismatches are
+// tolerated before the retry is reported as a terminal stream.ErrFormatDeadlock.
+// A couple of retries absorb transient platform blips; beyond that the
+// platform (e.g. DouYu moving a room to p2p) has switched for good, and the
+// client must reconnect to land in the forwarder matching the new format.
+const formatDeadlockThreshold = 3
+
 // buildExtractFn wraps an extractor in an ExtractFunc that enforces format
 // consistency on retry and caches the first extraction.
 //
@@ -215,13 +230,18 @@ func Forwarder(c *gin.Context) {
 //
 // On retry (previous!=nil) it re-extracts fresh using the initial format and
 // rejects URLs whose format differs, so a stream never switches between
-// FLV/HLS/WebSocket mid-flight.
+// FLV/HLS/WebSocket mid-flight. When the mismatch persists for
+// formatDeadlockThreshold consecutive retries, the error wraps
+// stream.ErrFormatDeadlock: producers then stop looping and close, and the
+// client's reconnect re-dispatches into the forwarder the platform now
+// serves (e.g. websocket for p2p rooms).
 func buildExtractFn(ext extractor.Extractor, desiredFormat string) stream.ExtractFunc {
 	var (
-		initialFormat string
-		initOnce      sync.Once
-		initResult    *stream.ExtractResult
-		initErr       error
+		initialFormat  string
+		initOnce       sync.Once
+		initResult     *stream.ExtractResult
+		initErr        error
+		formatMismatch int
 	)
 	// doExtract performs a fresh extraction and returns the wrapped result
 	// together with the format derived from the URL.
@@ -265,8 +285,15 @@ func buildExtractFn(ext extractor.Extractor, desiredFormat string) stream.Extrac
 			return nil, err
 		}
 		if fmtName != initialFormat {
+			formatMismatch++
+			if formatMismatch > formatDeadlockThreshold {
+				log := global.Log.WithField("func", "app.http.controllers.buildExtractFn")
+				log.Errorf("stream format changed from %s to %s permanently after %d retries", initialFormat, fmtName, formatDeadlockThreshold)
+				return nil, fmt.Errorf("stream format changed from %s to %s permanently: %w", initialFormat, fmtName, stream.ErrFormatDeadlock)
+			}
 			return nil, fmt.Errorf("format changed from %s to %s, will retry", initialFormat, fmtName)
 		}
+		formatMismatch = 0
 		return r, nil
 	}
 }

@@ -1,6 +1,7 @@
 package hls
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -131,6 +132,14 @@ func (s *HLSStream) produce() {
 		if mediaPlaylistURL == "" {
 			result, err := s.extractFn(previous)
 			if err != nil {
+				if errors.Is(err, stream.ErrFormatDeadlock) {
+					// Platform switched this room to another protocol for
+					// good; close so the client reconnects into the right
+					// forwarder instead of retrying forever.
+					log.Errorf("extract format deadlock, closing stream: %s", err.Error())
+					s.closeWithError(err)
+					return
+				}
 				log.Warnf("extract error: %s", err.Error())
 				time.Sleep(2 * time.Second)
 				continue
@@ -337,13 +346,21 @@ func resolveURL(baseURL, refURL string) string {
 	return base.ResolveReference(ref).String()
 }
 
-// isExpiredHLS reports whether the error indicates the URL has expired (403),
-// requiring re-extraction to obtain a fresh URL.
+// isExpiredHLS reports whether the error indicates the URL is no longer
+// usable (403/404/410) or the CDN node is misbehaving (5xx), requiring
+// re-extraction to obtain a fresh URL — which also picks a different CDN
+// node. Playlist and segment fetches both route here.
 func isExpiredHLS(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "403")
+	msg := err.Error()
+	for _, code := range []string{"403", "404", "410", "500", "502", "503", "504"} {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
 }
 
 // isTransientHLS reports whether the error is a transient network issue

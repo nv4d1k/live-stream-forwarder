@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 )
 
 // fakeExtractor is a test double for extractor.Extractor that counts
@@ -152,5 +153,115 @@ func TestBuildExtractFn_ExtractError(t *testing.T) {
 	}
 	if ext.callCount() != 1 {
 		t.Errorf("expected extractor called once (error cached), got %d", ext.callCount())
+	}
+}
+
+// TestBuildExtractFn_FormatMismatchRetriesThenDeadlock verifies that a
+// persistent format change on retry (e.g. DouYu switching a room to p2p
+// mid-stream) is tolerated for a few attempts and then reported as a
+// terminal ErrFormatDeadlock so the forwarder can stop looping and let the
+// client reconnect into the right forwarder.
+func TestBuildExtractFn_FormatMismatchRetriesThenDeadlock(t *testing.T) {
+	ext := &fakeExtractor{
+		url:     "https://host/live/test.flv",
+		formats: []string{"flv", "m3u8", "ws"},
+	}
+	fn := buildExtractFn(ext, "flv")
+
+	first, err := fn(nil)
+	if err != nil {
+		t.Fatalf("first extract: %v", err)
+	}
+
+	// The platform now serves the room as p2p: every retry yields ws.
+	ext.url = "wss://host/live/test.xs"
+	for i := 1; i <= formatDeadlockThreshold; i++ {
+		_, err := fn(first)
+		if err == nil {
+			t.Fatalf("attempt %d: expected mismatch error, got nil", i)
+		}
+		if errors.Is(err, stream.ErrFormatDeadlock) {
+			t.Fatalf("attempt %d: deadlock fired too early (threshold %d)", i, formatDeadlockThreshold)
+		}
+	}
+
+	// Next attempt must be terminal.
+	_, err = fn(first)
+	if err == nil {
+		t.Fatal("expected terminal deadlock error, got nil")
+	}
+	if !errors.Is(err, stream.ErrFormatDeadlock) {
+		t.Fatalf("expected ErrFormatDeadlock after %d mismatches, got: %v", formatDeadlockThreshold+1, err)
+	}
+}
+
+// TestBuildExtractFn_FormatMismatchCounterResets verifies the mismatch
+// counter resets after a format-consistent extraction, so a one-off blip
+// never accumulates toward a deadlock.
+func TestBuildExtractFn_FormatMismatchCounterResets(t *testing.T) {
+	ext := &fakeExtractor{
+		url:     "https://host/live/test.flv",
+		formats: []string{"flv", "m3u8", "ws"},
+	}
+	fn := buildExtractFn(ext, "flv")
+
+	first, err := fn(nil)
+	if err != nil {
+		t.Fatalf("first extract: %v", err)
+	}
+
+	// One mismatch, then back to the original format.
+	ext.url = "wss://host/live/test.xs"
+	if _, err := fn(first); err == nil {
+		t.Fatal("expected mismatch error on ws retry")
+	}
+	ext.url = "https://host/live/test.flv"
+	if _, err := fn(first); err != nil {
+		t.Fatalf("expected consistent retry to succeed: %v", err)
+	}
+
+	// Threshold mismatches in a row must still deadlock (counter was reset).
+	ext.url = "wss://host/live/test.xs"
+	for i := 0; i < formatDeadlockThreshold; i++ {
+		if _, err := fn(first); err == nil {
+			t.Fatal("expected mismatch errors")
+		}
+	}
+	_, err = fn(first)
+	if !errors.Is(err, stream.ErrFormatDeadlock) {
+		t.Fatalf("expected deadlock after %d consecutive mismatches, got: %v", formatDeadlockThreshold+1, err)
+	}
+}
+
+// TestBuildExtractFn_XSIsFlvFamily verifies that a retry returning a DouYu
+// p2p=2 .xs URL is treated as the same format as the original .flv URL:
+// dispatchStream already routes .xs to the FLV forwarder, so the stream
+// continues seamlessly instead of reporting a format mismatch.
+func TestBuildExtractFn_XSIsFlvFamily(t *testing.T) {
+	ext := &fakeExtractor{
+		url:     "https://host/live/test.flv",
+		formats: []string{"flv", "m3u8", "ws"},
+	}
+	fn := buildExtractFn(ext, "flv")
+
+	first, err := fn(nil)
+	if err != nil {
+		t.Fatalf("first extract: %v", err)
+	}
+	if first.URL != "https://host/live/test.flv" {
+		t.Fatalf("unexpected first url %q", first.URL)
+	}
+
+	// Server switches to p2p=2: same http-flv family, .xs extension.
+	ext.url = "https://hlsh5p2.douyucdn2.cn/live/test.xs?txSecret=s"
+	second, err := fn(first)
+	if err != nil {
+		t.Fatalf("xs retry must be accepted as flv family: %v", err)
+	}
+	if second.URL != ext.url {
+		t.Fatalf("unexpected retry url %q", second.URL)
+	}
+	if fmts := ext.lastFormats(); len(fmts) != 2 || fmts[1] != "flv" {
+		t.Errorf("expected retry with initial format flv, got %v", fmts)
 	}
 }

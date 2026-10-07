@@ -516,6 +516,16 @@ func (c *client) reconnect() bool {
 
 		result, extractErr := c.extractFn(c.previous)
 		if extractErr != nil {
+			if errors.Is(extractErr, stream.ErrFormatDeadlock) {
+				// The platform permanently switched this room away from ws
+				// (e.g. DouYu pulling it back to an http CDN). No retry can
+				// restore a websocket stream, so stop immediately and let
+				// the client reconnect into the forwarder matching the new
+				// format instead of burning the whole retry budget.
+				log.Errorf("extract format deadlock, stopping reconnect: %s", extractErr.Error())
+				c.pipe.CloseWithError(extractErr)
+				return false
+			}
 			log.WithField("field", "attempt").Warnf("extract for reconnect error (%d): %s", fails+1, extractErr.Error())
 		} else if !isWebSocketURL(result.URL) {
 			// The platform may stop serving ws for this room; treat as a

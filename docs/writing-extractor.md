@@ -28,12 +28,26 @@ The `Result` struct:
 
 ```go
 type Result struct {
-    URL     string
-    Headers http.Header
+    URL             string
+    Headers         http.Header
+    ExpireAt        *time.Time // when the URL expires; nil means unknown or no expiry
+    VariantSelector any        // optional func([]*libm3u8.Variant) *libm3u8.Variant; used by the HLS forwarder
 }
 ```
 
-Set `Headers` when the upstream server requires specific headers (e.g. `Referer`, `Cookie`). The forwarder will include these headers when fetching the stream.
+| Field | Description |
+|-------|-------------|
+| `URL` | The resolved stream URL. Its scheme and path extension determine which forwarder handles it (see Format Routing below). |
+| `Headers` | Set when the upstream server requires specific headers (e.g. `Referer`, `Cookie`). The forwarder will include these headers when fetching the stream. |
+| `ExpireAt` | Optional but recommended: when the platform knows the URL's lifetime, parse it into this field. Every forwarder (FLV, HLS, WebSocket) will proactively re-extract a fresh URL about 60 seconds before this moment, so the handover happens while the CDN still serves the old token. When nil, refresh is purely error-driven (a 403/reset triggers the re-extract instead). |
+| `VariantSelector` | Optional, for HLS master playlists only: a `func([]*libm3u8.Variant) *libm3u8.Variant` that overrides the default highest-bandwidth variant pick (see `hls.PickSecondHighestBandwidthVariant` for an exported example). |
+
+**Parsing expiry**: platforms usually embed the lifetime in the stream URL's query parameters, so `ExpireAt` is best derived right after building the URL:
+
+- BiliBili: absolute Unix-seconds `expires` (see `BiliBili/expire.go`)
+- DouYu: relative `expire` (seconds) or absolute hex `txTime` — earliest wins (see `DouYu/expire.go`)
+
+If your platform's URLs carry any such parameter, wire it up — it converts mid-stream token expiry from a visible stall into a seamless reconnect.
 
 ## Step-by-Step Guide
 
@@ -43,7 +57,7 @@ Set `Headers` when the upstream server requires specific headers (e.g. `Referer`
 app/engine/extractor/MyPlatform/
 ```
 
-The directory name becomes the URL token — users access streams at `http://localhost:8080/myplatform/<room>` (lowercased automatically).
+The URL token is the name you pass to `extractor.Register()` (first argument, lowercase by convention) — users access streams at `http://localhost:8080/myplatform/<room>`. Keep the directory name aligned with it for readability (e.g. directory `BiliBili`, registered as `"bilibili"`).
 
 ### 2. Implement the extractor
 
@@ -108,7 +122,16 @@ func (l *Link) Extract(format string) (*extractor.Result, error) {
         return nil, err
     }
     log.Debugf("extracted stream URL for room %s", l.rid)
-    return &extractor.Result{URL: u}, nil
+    headers := make(http.Header)
+    headers.Set("Referer", "https://example.com") // if upstream requires it
+    return &extractor.Result{
+        URL:     u,
+        Headers: headers,
+        // Parse the URL lifetime when the platform embeds one (e.g. an
+        // "expires" query param), so forwarders refresh proactively
+        // instead of waiting for a 403 mid-stream:
+        // ExpireAt: expireAtFromURL(u),
+    }, nil
 }
 
 func (l *Link) SupportedFormats() []string {
@@ -198,6 +221,13 @@ The controller automatically dispatches to the correct forwarder based on the UR
 
 Your `SupportedFormats()` should return format identifiers that match the extensions the upstream URLs will have. For example, if the platform returns `.flv` URLs, include `"flv"` in the supported formats.
 
+**Initial extraction is format-adaptive**: the `format` argument to `Extract()` is a preference, not a guarantee. If the caller asks for `flv` but the platform returns a `wss://...` URL, the controller routes to the WebSocket forwarder and records `ws` as the session's format. Return whatever the platform actually serves.
+
+**Format consistency during reconnects**: when a URL expires mid-stream and the forwarder re-extracts, the new URL must resolve to the same format the client is already receiving (the HTTP response is committed to it). Two rules to know:
+
+- `.xs` and `.flv` count as the **same** format (DouYu p2p=2 serves identical FLV payload under a `.xs` extension), so a platform switching between them reconnects seamlessly.
+- If your platform can switch a room to a different protocol mid-stream (e.g. DouYu moving rooms to p2p/ws), the controller tolerates a few consecutive mismatches and then reports a terminal `stream.ErrFormatDeadlock`, which closes the client connection. The client's reconnect then re-dispatches into the forwarder matching the new format — that is the intended recovery, not a bug. There is no way to hand a live HTTP-FLV response over to the WebSocket forwarder mid-stream.
+
 ### HTTP Client
 
 Use `httpweb.NewAddHeaderTransport` to create an HTTP transport that injects the appropriate User-Agent:
@@ -223,6 +253,7 @@ Write tests in `<platform>_test.go`. Key areas to test:
 - `DefaultFormat()` returns the expected format
 - Registry entry exists with correct `Mobile` and `InitialError` values
 - Core extraction logic (mock HTTP servers with `httptest.NewServer`)
+- Expiry parsing, if the platform embeds the URL lifetime (e.g. `ExpireAt` set from an `expires` param; nil for missing/unparsable values)
 
 Initialize `global.Log` in `TestMain`:
 

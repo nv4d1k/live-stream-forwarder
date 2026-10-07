@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -734,5 +735,36 @@ func TestReadDeadlinePipeStall(t *testing.T) {
 	d = cl.readDeadline()
 	if got := time.Until(d); got < 4*time.Second || got > 5*time.Second {
 		t.Errorf("readDeadline() = %v from now, want ~5s (pipe watchdog)", got)
+	}
+}
+
+// TestReconnectStopsOnFormatDeadlock verifies that a terminal format
+// deadlock (the platform permanently switched the room away from ws, e.g.
+// DouYu pulling it back to http CDN) stops the reconnect loop immediately
+// instead of burning the whole retry budget on attempts that cannot succeed.
+func TestReconnectStopsOnFormatDeadlock(t *testing.T) {
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		calls.Add(1)
+		return nil, fmt.Errorf("format changed from ws to flv: %w", stream.ErrFormatDeadlock)
+	}, nil, nil, "").(*client)
+	// A generous budget: if the deadlock sentinel is ignored, the loop runs
+	// all 10 attempts and the call count exposes the bug.
+	cl.maxReconnectFails = 10
+	cl.backoffs = []time.Duration{1 * time.Millisecond}
+	defer cl.Close()
+
+	if cl.reconnect() {
+		t.Fatal("reconnect must fail on format deadlock")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("extractFn called %d times, want 1 (deadlock must stop retries immediately)", got)
+	}
+	err := cl.pipe.Err()
+	if err == nil {
+		t.Fatal("pipe must be closed with the deadlock error")
+	}
+	if !errors.Is(err, stream.ErrFormatDeadlock) {
+		t.Errorf("expected pipe error wrapping ErrFormatDeadlock, got: %v", err)
 	}
 }

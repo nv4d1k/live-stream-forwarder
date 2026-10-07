@@ -4,11 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/grafov/m3u8"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/sirupsen/logrus"
 )
@@ -229,6 +232,36 @@ func TestIsExpiredHLS(t *testing.T) {
 			err:  errors.New("unexpected EOF"),
 			want: false,
 		},
+		{
+			name: "404 means URL is stale, re-extract heals",
+			err:  errors.New("get m3u8 err got: 404 Not Found"),
+			want: true,
+		},
+		{
+			name: "410 gone means URL is stale",
+			err:  errors.New("get m3u8 err got: 410 Gone"),
+			want: true,
+		},
+		{
+			name: "500 is worth a re-extract to switch CDN node",
+			err:  errors.New("get m3u8 err got: 500 Internal Server Error"),
+			want: true,
+		},
+		{
+			name: "502 is worth a re-extract to switch CDN node",
+			err:  errors.New("get m3u8 err got: 502 Bad Gateway"),
+			want: true,
+		},
+		{
+			name: "503 is worth a re-extract to switch CDN node",
+			err:  errors.New("get m3u8 err got: 503 Service Unavailable"),
+			want: true,
+		},
+		{
+			name: "400 stays not expired",
+			err:  errors.New("get m3u8 err got: 400 Bad Request"),
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -302,3 +335,30 @@ func (e *timeoutError) Timeout() bool   { return true }
 func (e *timeoutError) Temporary() bool { return true }
 
 var _ net.Error = (*timeoutError)(nil)
+
+// TestHLSStream_ExtractDeadlockCloses verifies that a terminal extraction
+// error (stream.ErrFormatDeadlock, e.g. the platform switched the room to a
+// non-HLS protocol mid-stream) closes the HLS stream instead of retrying
+// forever.
+func TestHLSStream_ExtractDeadlockCloses(t *testing.T) {
+	extractFn := func(previous *stream.ExtractResult) (*stream.ExtractResult, error) {
+		return nil, fmt.Errorf("format changed from m3u8 to ws: %w", stream.ErrFormatDeadlock)
+	}
+
+	s := NewHLSStream(extractFn, &http.Client{})
+	defer s.Close()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Wait() }()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Error("expected Wait to return the deadlock error, got nil")
+		}
+		if !errors.Is(err, stream.ErrFormatDeadlock) {
+			t.Errorf("expected error wrapping ErrFormatDeadlock, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("HLSStream never closed: extract deadlock loops forever")
+	}
+}

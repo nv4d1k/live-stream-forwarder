@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -365,5 +366,29 @@ func TestDouYu_CalcAuth_ZeroEncTime(t *testing.T) {
 
 	if auth != expected {
 		t.Errorf("calculateAuth() with enc_time=0 = %q, want %q", auth, expected)
+	}
+}
+
+// TestGetLink_UnknownP2PMode verifies that an unrecognized p2p value yields
+// an explicit error instead of a nil URL, which would panic in Extract.
+func TestGetLink_UnknownP2PMode(t *testing.T) {
+	rateStream := `{
+		"error": 0,
+		"data": {
+			"p2p": 42,
+			"rtmp_url": "https://dummy",
+			"rtmp_live": "streamname.flv"
+		}
+	}`
+	l := &Link{rid: "123", rateStreamFn: func() (gjson.Result, error) {
+		return gjson.Parse(rateStream), nil
+	}}
+
+	_, err := l.GetLink("flv")
+	if err == nil {
+		t.Fatal("expected error for unknown p2p mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "p2p") {
+		t.Errorf("expected p2p mode in error message, got: %v", err)
 	}
 }

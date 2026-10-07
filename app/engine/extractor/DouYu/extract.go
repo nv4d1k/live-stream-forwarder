@@ -105,5 +105,7 @@ func (l *Link) GetLink(_ string) (*url.URL, error) {
 		u = strings.ReplaceAll(u, ".flv", ".xs")
 		return url.Parse(u)
 	}
-	return nil, nil
+	// Unknown p2p mode: returning a nil URL here would panic in Extract,
+	// so surface the unexpected value instead.
+	return nil, fmt.Errorf("unsupported p2p mode %d returned by rate stream api", data.Get("data.p2p").Int())
 }

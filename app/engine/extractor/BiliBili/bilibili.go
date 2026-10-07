@@ -58,7 +58,11 @@ func (l *Link) Extract(format string) (*extractor.Result, error) {
 	}
 	headers := make(http.Header)
 	headers.Set("Referer", "https://live.bilibili.com")
-	return &extractor.Result{URL: u.String(), Headers: headers}, nil
+	return &extractor.Result{
+		URL:      u.String(),
+		Headers:  headers,
+		ExpireAt: expireAtFromURL(u),
+	}, nil
 }
 
 func (l *Link) SupportedFormats() []string {

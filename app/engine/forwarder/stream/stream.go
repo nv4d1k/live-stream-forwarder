@@ -1,13 +1,16 @@
 package stream
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/global"
@@ -17,6 +20,16 @@ import (
 // previous is nil on the first call, and set to the previous result on retries,
 // so the extractor can ensure format consistency.
 type ExtractFunc func(previous *ExtractResult) (*ExtractResult, error)
+
+// ErrFormatDeadlock marks an extraction error that retrying provably cannot
+// resolve: the platform has permanently switched this room to a different
+// protocol mid-stream (e.g. DouYu moving a room to p2p/ws while an FLV
+// session is already underway). The HTTP response is already committed to
+// the original format, so the only recovery is for the client to reconnect,
+// which re-dispatches into the forwarder matching the new format. Producers
+// receiving an error wrapping this sentinel must close the stream instead of
+// looping forever.
+var ErrFormatDeadlock = errors.New("stream format changed permanently")
 
 // ExtractResult holds the resolved URL and optional headers needed to fetch it.
 type ExtractResult struct {
@@ -97,20 +110,50 @@ func (s *Stream) Wait() error {
 	return s.closeErr
 }
 
+// Retry backoff bounds: every failure in the produce loop sleeps at least
+// retryBackoffBase (doubling up to retryBackoffMax) before the next attempt,
+// so repeated upstream/API failures can never hot-loop against the platform
+// API (which would trigger rate-limiting and turn a transient hiccup into an
+// outage). Package-level var so tests can shorten it.
+var (
+	retryBackoffBase = 1 * time.Second
+	retryBackoffMax  = 10 * time.Second
+)
+
+// refreshLeadTime is how long before ExtractResult.ExpireAt the producer
+// proactively drops the upstream connection and re-extracts a fresh URL,
+// instead of waiting for the CDN to start rejecting the stale one.
+const refreshLeadTime = 60 * time.Second
+
 func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 	log := global.Log.WithField("func", "app.engine.forwarder.stream.produce")
 	var previous *ExtractResult
+	backoff := retryBackoffBase
 
 	for {
 		result, err := extractFn(previous)
 		if err != nil {
+			if errors.Is(err, ErrFormatDeadlock) {
+				// The platform switched this room to another protocol for
+				// good; no retry can fix it. Close so the client reconnects
+				// into the forwarder matching the new format.
+				log.Errorf("extract format deadlock, closing stream: %s", err.Error())
+				s.closeWithError(err)
+				return
+			}
 			log.Warnf("extract error: %s", err.Error())
+			if !s.sleepBackoff(&backoff) {
+				return
+			}
 			continue
 		}
 
 		// On retry: validate that the new URL format matches the initial one.
 		if previous != nil && !formatMatches(previous.URL, result.URL) {
 			log.Warnf("extract returned different format (was %s, got %s), retrying", previous.URL, result.URL)
+			if !s.sleepBackoff(&backoff) {
+				return
+			}
 			continue
 		}
 
@@ -118,6 +161,9 @@ func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 		if err != nil {
 			if isRetriable(err) {
 				log.Warnf("fetch retriable error: %s", err.Error())
+				if !s.sleepBackoff(&backoff) {
+					return
+				}
 				continue
 			}
 			s.closeWithError(err)
@@ -125,11 +171,40 @@ func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 		}
 
 		previous = result
+		backoff = retryBackoffBase // extract + fetch succeeded, reset backoff
+
 		var w io.Writer = s.pipe
 		if s.writerWrapper != nil {
 			w = s.writerWrapper(s.pipe)
 		}
+
+		// Proactive refresh: when the URL carries an expiry, drop the
+		// connection shortly before it goes stale and re-extract, so the
+		// handover happens while the CDN still serves the old token.
+		refreshed := &atomic.Bool{}
+		var refreshTimer *time.Timer
+		if result.ExpireAt != nil {
+			remaining := time.Until(*result.ExpireAt)
+			lead := refreshLeadTime
+			// Short-lived tokens: refresh 5s before expiry at the latest.
+			if remaining < lead+5*time.Second {
+				lead = remaining - 5*time.Second
+				if lead < 0 {
+					lead = 0
+				}
+			}
+			when := remaining - lead
+			log.Debugf("url expires at %s, scheduling proactive refresh in %s", result.ExpireAt.Format(time.RFC3339), when)
+			refreshTimer = time.AfterFunc(when, func() {
+				refreshed.Store(true)
+				body.Close() // unblocks a Read parked inside io.Copy
+			})
+		}
+
 		_, err = io.Copy(w, body)
+		if refreshTimer != nil {
+			refreshTimer.Stop()
+		}
 		body.Close()
 
 		if s.pipe.Err() != nil {
@@ -137,9 +212,18 @@ func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 			return
 		}
 
+		if refreshed.Load() {
+			// Timer-initiated close: reconnect with a fresh URL, not a failure.
+			log.Infoln("proactive refresh triggered, re-extracting")
+			continue
+		}
+
 		if err != nil {
 			if isRetriable(err) {
 				log.Warnf("copy retriable error: %s", err.Error())
+				if !s.sleepBackoff(&backoff) {
+					return
+				}
 				continue
 			}
 			s.closeWithError(err)
@@ -151,6 +235,26 @@ func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 	}
 }
 
+// sleepBackoff waits for the current backoff interval, doubling it (up to
+// retryBackoffMax) for the next failure. Returns false when the stream was
+// closed while sleeping, meaning the caller must stop producing.
+func (s *Stream) sleepBackoff(backoff *time.Duration) bool {
+	log := global.Log.WithField("func", "app.engine.forwarder.stream.sleepBackoff")
+	log.Debugf("retrying in %s", *backoff)
+	t := time.NewTimer(*backoff)
+	defer t.Stop()
+	*backoff *= 2
+	if *backoff > retryBackoffMax {
+		*backoff = retryBackoffMax
+	}
+	select {
+	case <-t.C:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
 func (s *Stream) closeWithError(err error) {
 	log := global.Log.WithField("func", "app.engine.forwarder.stream.closeWithError")
 	log.Warnf("closing stream with error: %s", err.Error())
@@ -159,8 +263,10 @@ func (s *Stream) closeWithError(err error) {
 	close(s.done)
 }
 
-// formatMatches checks that two URLs have the same scheme and path extension,
-// so re-extraction doesn't switch between FLV/HLS/WebSocket mid-stream.
+// formatMatches checks that two URLs have the same scheme and path extension
+// family, so re-extraction doesn't switch between FLV/HLS/WebSocket
+// mid-stream. DouYu p2p=2 serves the same http-flv payload under a ".xs"
+// extension, so .xs and .flv count as the same format.
 func formatMatches(a, b string) bool {
 	ua, erra := url.Parse(a)
 	ub, errb := url.Parse(b)
@@ -172,7 +278,7 @@ func formatMatches(a, b string) bool {
 		log.Debugf("scheme mismatch: %s vs %s", ua.Scheme, ub.Scheme)
 		return false
 	}
-	if path.Ext(ua.Path) != path.Ext(ub.Path) {
+	if normalizeExt(path.Ext(ua.Path)) != normalizeExt(path.Ext(ub.Path)) {
 		log := global.Log.WithField("func", "app.engine.forwarder.stream.formatMatches")
 		log.Debugf("extension mismatch: %s vs %s", path.Ext(ua.Path), path.Ext(ub.Path))
 		return false
@@ -180,14 +286,55 @@ func formatMatches(a, b string) bool {
 	return true
 }
 
-// isRetriable checks if an error indicates a 403 (URL expired) or other
-// retriable condition.
+// normalizeExt folds extensions serving identical payloads into one family.
+func normalizeExt(ext string) string {
+	if ext == ".xs" {
+		return ".flv"
+	}
+	return ext
+}
+
+// retriablePatterns are error fragments that mark an upstream failure worth
+// retrying with a fresh extraction: stale-URL status codes the CDN answers
+// once a token dies (403/404/410), server-side faults (5xx), and transient
+// network conditions. Everything else (e.g. a 400) is treated as fatal.
+var retriablePatterns = []string{
+	"403", "404", "410",
+	"500", "502", "503", "504",
+	"connection reset",
+	"connection refused",
+	"connection aborted",
+	"unexpected eof",
+	"broken pipe",
+	"server closed",
+	"context deadline",
+	"timeout",
+	"temporary failure",
+}
+
+// isRetriable checks if an error indicates a condition that a fresh
+// extraction can heal: URL expiry (403/404/410), upstream server faults
+// (5xx) or transient network failures (reset/EOF/timeout). Only errors
+// that are deterministic — where retrying provably cannot help — stay
+// fatal and close the client stream.
 func isRetriable(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "403")
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pattern := range retriablePatterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // Ensure ExtractResult is usable — the fmt import is needed for potential
