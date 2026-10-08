@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
@@ -41,7 +42,6 @@ func NewDouYinLink(rid string, proxy *url.URL) (douyin *Link, err error) {
 	} else {
 		douyin.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
 	}
-	douyin.cookies = &http.Cookie{}
 	err = douyin.getCookies()
 	if err != nil {
 		log.WithError(err).Errorln("failed to get cookies")
@@ -61,8 +61,13 @@ func (l *Link) Extract(format string) (*extractor.Result, error) {
 		log.WithError(err).Errorln("failed to get stream URL")
 		return nil, err
 	}
+	result := &extractor.Result{URL: u.String()}
+	result.ExpireAt = expireAtFromURL(u)
+	if result.ExpireAt != nil {
+		log.WithField("field", "expire at").Debugf("url expires at %s", result.ExpireAt.Format(time.RFC3339))
+	}
 	log.WithField("url", u.String()).Debugln("extracted stream URL")
-	return &extractor.Result{URL: u.String()}, nil
+	return result, nil
 }
 
 func (l *Link) SupportedFormats() []string {

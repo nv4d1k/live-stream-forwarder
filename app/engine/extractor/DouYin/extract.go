@@ -1,72 +1,100 @@
 package DouYin
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
-	"github.com/antchfx/htmlquery"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/tidwall/gjson"
 )
 
-var QIALITIES = []string{"origin", "hd", "sd", "ld", "md"}
+// QUALITIES is the preference order for stream quality tiers returned by the
+// enter API. The picker takes the first tier that carries a URL.
+var QUALITIES = []string{"FULL_HD1", "HD1", "SD1", "SD2"}
+
+// enterAPIURL returns the room enter API endpoint for the given web_rid.
+// The four browser_* params are mandatory: dropping any of them makes the
+// API answer with an empty body.
+func enterAPIURL(rid string) string {
+	q := url.Values{}
+	q.Set("aid", "6383")
+	q.Set("app_name", "douyin_web")
+	q.Set("live_id", "1")
+	q.Set("device_platform", "web")
+	q.Set("web_rid", rid)
+	q.Set("browser_language", "zh-CN")
+	q.Set("browser_platform", "MacIntel")
+	q.Set("browser_name", "Chrome")
+	q.Set("browser_version", "155.0.0.0")
+	return "https://live.douyin.com/webcast/room/web/enter/?" + q.Encode()
+}
 
 func (l *Link) getCookies() error {
 	log := global.Log.WithField("func", "app.engine.extractor.DouYin.getCookies")
-	reAcNonce := regexp.MustCompile(`(?i)__ac_nonce=([0-9a-f]*?);`)
-	reTtwid := regexp.MustCompile(`(?i)ttwid=(\S*);`)
+	// ttwid is issued on the first page hit. When rate limiting kicks in the
+	// page may only answer with __ac_nonce; carrying it into one retry usually
+	// unlocks the ttwid response.
+	for attempt := range 2 {
+		req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/%s", l.rid), nil)
+		if err != nil {
+			return fmt.Errorf("making request for ttwid error: %w", err)
+		}
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+		if l.cookies != nil {
+			req.AddCookie(l.cookies)
+		}
+		log.WithField("attempt", attempt).Debugln("requesting room page for cookies")
+		resp, err := l.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("get ttwid error: %w", err)
+		}
+		defer resp.Body.Close()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			log.WithError(err).Debugln("failed to drain response body")
+		}
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/%s", l.rid), nil)
-	if err != nil {
-		return fmt.Errorf("making request for get __ac_nonce or ttwid error: %w", err)
+		var acNonce *http.Cookie
+		for _, c := range resp.Cookies() {
+			switch c.Name {
+			case "ttwid":
+				if c.Value != "" {
+					log.Debugln("ttwid found")
+					l.cookies = c
+					return nil
+				}
+			case "__ac_nonce":
+				if c.Value != "" {
+					acNonce = c
+				}
+			}
+		}
+		if acNonce != nil && l.cookies == nil {
+			log.Debugln("__ac_nonce found, retrying page request with it")
+			l.cookies = acNonce
+			continue
+		}
+		break
 	}
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.AddCookie(l.cookies)
-	log.WithField("field", "sending requests").Debugf("%v\n", req)
-	resp, err := l.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("get get __ac_nonce or ttwid error: %w", err)
-	}
-	defer resp.Body.Close()
-	switch {
-	case reAcNonce.MatchString(resp.Header.Get("Set-Cookie")):
-		acNonce := reAcNonce.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
-		log.WithField("__ac_nonce", acNonce).Debugln("__ac_nonce found")
-		l.cookies = &http.Cookie{Name: "__ac_nonce", Value: acNonce}
-		/*
-				return l.getCookies()
-			case reTtwid.MatchString(resp.Header.Get("Set-Cookie")):
-				ttwid := reTtwid.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
-				l.cookies = &http.Cookie{Name: "ttwid", Value: ttwid}
-		*/
-	case reTtwid.MatchString(resp.Header.Get("Set-Cookie")):
-		ttwid := reTtwid.FindStringSubmatch(resp.Header.Get("Set-Cookie"))[1]
-		log.WithField("ttwid", ttwid).Debugln("ttwid found")
-		l.cookies = &http.Cookie{Name: "ttwid", Value: ttwid}
-	default:
-		return errors.New("both __ac_nonce and ttwid are not found")
-	}
-	return nil
+	return errors.New("ttwid not found in response cookies")
 }
 
 func (l *Link) GetLink(format string) (*url.URL, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.DouYin.GetLink")
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://live.douyin.com/%s", l.rid), nil)
+	req, err := http.NewRequest("GET", enterAPIURL(l.rid), nil)
 	if err != nil {
 		return nil, fmt.Errorf("making request for get link error: %w", err)
 	}
-	req.AddCookie(l.cookies)
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Host", "live.douyin.com")
-	req.Header.Set("Connection", "keep-alive")
-	log.WithField("field", "sending requests with cookies").Debugf("%v\n", req)
+	if l.cookies != nil {
+		req.AddCookie(l.cookies)
+	}
+	log.WithField("field", "sending enter api request").Debugf("%v\n", req)
 	resp, err := l.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request for get link error: %w", err)
@@ -76,79 +104,73 @@ func (l *Link) GetLink(format string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing response body error: %w", err)
 	}
-	log.WithField("headers", resp.Header).Debugln("response header of request with cookies")
-	doc, err := htmlquery.Parse(strings.NewReader(string(body)))
+	log.WithField("status", resp.StatusCode).Debugln("response of enter api request")
+	data := gjson.ParseBytes(body)
+	if err := enterAPIError(data); err != nil {
+		log.WithError(err).Warnln("enter api reported an error")
+		return nil, err
+	}
+	room := data.Get("data.data.0")
+	u, err := pickStreamURL(room, format)
 	if err != nil {
-		return nil, fmt.Errorf("parsing response body error: %w", err)
+		log.WithError(err).Errorln("no stream url in enter api response")
+		return nil, err
 	}
-	var liveData string
-	nodes := htmlquery.Find(doc, "//script")
-	for _, node := range nodes {
-		log.WithField("field", "script node").Debugln(htmlquery.InnerText(node))
-		content, ok := l.extractJSON(htmlquery.InnerText(node))
-		if ok {
-			liveData = content
-			break
-		}
-	}
-	var stream gjson.Result
-	for _, quality := range QIALITIES {
-		if gjson.Get(liveData, fmt.Sprintf("data.%s", quality)).Exists() {
-			stream = gjson.Get(liveData, fmt.Sprintf("data.%s", quality))
-			break
-		}
-	}
-	var (
-		u string
-	)
-	log.WithField("field", "stream data").Debugln(stream.Raw)
-	if format == "" {
-		format = "flv"
-	}
-	switch format {
-	case "flv":
-		u = stream.Get("main.flv").String()
-		log.WithField("stream_url", u).Debugln("get origin flv url")
-		return url.Parse(u)
-	default:
-		u = stream.Get("main.hls").String()
-		log.WithField("stream_url", u).Debugln("get origin hls url")
-		return url.Parse(u)
-	}
+	log.WithField("stream_url", u).Debugln("got stream url")
+	return url.Parse(u)
 }
 
-func (l *Link) extractJSON(input string) (string, bool) {
-	log := global.Log.WithField("func", "app.engine.extractor.DouYin.extractJSON")
-	re := regexp.MustCompile(`self\.__pace_f\.push\(\[1,"(.*)"\]\)`)
-	matches := re.FindStringSubmatch(input)
-	if len(matches) < 2 {
-		return "", false
+// enterAPIError inspects an enter API response body and returns a descriptive
+// error when the room cannot be watched (API error code set, no room in the
+// list, or room without stream data). nil means the response is usable.
+func enterAPIError(data gjson.Result) error {
+	if code := data.Get("status_code").Int(); code != 0 {
+		msg := data.Get("data.prompts").String()
+		if msg == "" {
+			msg = data.Get("data.message").String()
+		}
+		if msg == "" {
+			return fmt.Errorf("enter api error code %d", code)
+		}
+		return fmt.Errorf("enter api error code %d: %s", code, msg)
 	}
-
-	// Original escaped JSON
-	escaped := matches[1]
-
-	// Unescape to clean JSON
-	var raw string
-	if err := json.Unmarshal([]byte(`"`+escaped+`"`), &raw); err != nil {
-		log.WithError(err).Warnln("failed to unescape JSON from pace_f push")
-		return "", false
+	rooms := data.Get("data.data")
+	if !rooms.IsArray() || len(rooms.Array()) == 0 {
+		return errors.New("no room found (room may be offline or not exist)")
 	}
-
-	// Verify it's valid JSON and check if the "common" field exists
-	var parsed map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		log.WithError(err).Warnln("failed to parse extracted JSON")
-		return "", false
+	if !rooms.Get("0.stream_url").IsObject() {
+		return errors.New("room data carries no stream_url")
 	}
+	return nil
+}
 
-	// Go maps are unordered, so we can't directly check for the "first element".
-	// Therefore, we check if the "common" field must exist instead.
-	if _, ok := parsed["common"]; !ok {
-		log.Debugln("extracted JSON missing 'common' field, skipping")
-		return "", false
+// pickStreamURL selects the pull URL for the given format from an enter API
+// room object, always preferring the highest available quality tier.
+func pickStreamURL(room gjson.Result, format string) (string, error) {
+	field := "flv_pull_url"
+	if format != "flv" {
+		field = "hls_pull_url_map"
 	}
+	for _, quality := range QUALITIES {
+		if u := room.Get(strings.Join([]string{"stream_url", field, quality}, ".")).String(); u != "" {
+			return u, nil
+		}
+	}
+	return "", fmt.Errorf("no %s stream url available", field)
+}
 
-	log.Debugln("successfully extracted live data JSON")
-	return raw, true
+// expireAtFromURL derives the URL expiry time from its "expire" query
+// parameter, an absolute Unix timestamp. It returns nil when the parameter is
+// absent or unparsable.
+func expireAtFromURL(u *url.URL) *time.Time {
+	log := global.Log.WithField("func", "app.engine.extractor.DouYin.expireAtFromURL")
+	raw := u.Query().Get("expire")
+	secs, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || secs <= 0 {
+		log.WithField("field", "expire").Debugf("ignoring unparsable expire value %q", raw)
+		return nil
+	}
+	t := time.Unix(secs, 0)
+	log.WithField("field", "expire at").Debugf("url expires at %s", t.Format(time.RFC3339))
+	return &t
 }
