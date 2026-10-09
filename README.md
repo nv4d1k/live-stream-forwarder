@@ -12,6 +12,7 @@ Live Stream Forwarder (`lsf`) converts live streams from various platforms into 
 | [DouYin](https://live.douyin.com) | `douyin` | `http://localhost:8080/douyin/12345` |
 | [Twitch](https://www.twitch.tv) | `twitch` | `http://localhost:8080/twitch/eslcs` |
 | [Kick](https://kick.com) | `kick` | `http://localhost:8080/kick/eslcsb` |
+| [YouTube](https://www.youtube.com) | `youtube` | `http://localhost:8080/youtube/WWTcu33u00A` |
 
 ## Install
 
@@ -93,6 +94,19 @@ Available formats by platform:
 | DouYin | flv, m3u8 | flv |
 | Twitch | m3u8 | m3u8 |
 | Kick | m3u8 | m3u8 |
+| YouTube | m3u8 | m3u8 |
+
+### Quality selection
+
+YouTube streams can be capped at a specific resolution with the `?quality=` query parameter (e.g. `480p` or `480`). The closest variant not exceeding the requested height is picked:
+
+```
+http://<address>:<port>/youtube/WWTcu33u00A?quality=720p
+```
+
+Without the parameter the highest available variant is served (up to 1080p; YouTube's HLS caps at 1080p).
+
+> **Note**: YouTube URLs are bound to the proxy exit IP. Extraction and streaming must go through the same proxy — configure the global `--proxy` flag or pass `?proxy=` on the request (mandatory from mainland China).
 
 ## Features
 

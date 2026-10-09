@@ -37,6 +37,13 @@ type CookieSetter interface {
 	SetCookie(rawCookie string)
 }
 
+// QualitySetter is an optional interface that extractors can implement to
+// receive a desired quality hint (e.g. "720p") used when choosing between
+// stream variants.
+type QualitySetter interface {
+	SetQuality(quality string)
+}
+
 // Factory creates an Extractor for a given room ID and optional proxy.
 type Factory func(rid string, proxy *url.URL) (Extractor, error)
 

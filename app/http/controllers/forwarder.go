@@ -19,6 +19,7 @@ import (
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/HuYa"
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/Kick"
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/Twitch"
+	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/YouTube"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
@@ -187,6 +188,9 @@ func Forwarder(c *gin.Context) {
 		}
 	}
 
+	// 2c. Inject the quality hint if the extractor supports variant selection.
+	applyQualityHint(c, ext)
+
 	// 3. Resolve the desired format.
 	desiredFormat := resolveDesiredFormat(format, ext)
 
@@ -217,6 +221,19 @@ func Forwarder(c *gin.Context) {
 // platform (e.g. DouYu moving a room to p2p) has switched for good, and the
 // client must reconnect to land in the forwarder matching the new format.
 const formatDeadlockThreshold = 3
+
+// applyQualityHint injects the ?quality= query parameter into extractors
+// that implement extractor.QualitySetter. Extractors without the interface,
+// or requests without the parameter, are left untouched.
+func applyQualityHint(c *gin.Context, ext extractor.Extractor) {
+	log := global.Log.WithField("func", "app.http.controllers.applyQualityHint")
+	if qs, ok := ext.(extractor.QualitySetter); ok {
+		if q := c.Query("quality"); q != "" {
+			log.Debugf("injecting quality %q into extractor", q)
+			qs.SetQuality(q)
+		}
+	}
+}
 
 // buildExtractFn wraps an extractor in an ExtractFunc that enforces format
 // consistency on retry and caches the first extraction.

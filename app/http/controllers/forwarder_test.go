@@ -3,8 +3,11 @@ package controllers
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
@@ -264,4 +267,85 @@ func TestBuildExtractFn_XSIsFlvFamily(t *testing.T) {
 	if fmts := ext.lastFormats(); len(fmts) != 2 || fmts[1] != "flv" {
 		t.Errorf("expected retry with initial format flv, got %v", fmts)
 	}
+}
+
+// fakeQualityExtractor extends fakeExtractor with a QualitySetter recording
+// every quality hint it receives.
+type fakeQualityExtractor struct {
+	fakeExtractor
+	mu        sync.Mutex
+	qualities []string
+}
+
+func (f *fakeQualityExtractor) SetQuality(quality string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.qualities = append(f.qualities, quality)
+}
+
+func (f *fakeQualityExtractor) receivedQualities() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.qualities))
+	copy(out, f.qualities)
+	return out
+}
+
+func newTestContext(t *testing.T, target string) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, target, nil)
+	return c, w
+}
+
+// TestApplyQualityHint verifies that the ?quality= query parameter is
+// injected into extractors implementing QualitySetter, and that extractors
+// without the interface (or requests without the parameter) are untouched.
+func TestApplyQualityHint(t *testing.T) {
+	t.Run("injects quality when supported", func(t *testing.T) {
+		ext := &fakeQualityExtractor{fakeExtractor: fakeExtractor{
+			url:     "https://host/live/index.m3u8",
+			formats: []string{"m3u8"},
+		}}
+		c, _ := newTestContext(t, "/youtube/WWTcu33u00A?quality=720p")
+		applyQualityHint(c, ext)
+		if q := ext.receivedQualities(); len(q) != 1 || q[0] != "720p" {
+			t.Errorf("expected quality 720p to be injected, got %v", q)
+		}
+	})
+
+	t.Run("missing quality param is a no-op", func(t *testing.T) {
+		ext := &fakeQualityExtractor{fakeExtractor: fakeExtractor{
+			url:     "https://host/live/index.m3u8",
+			formats: []string{"m3u8"},
+		}}
+		c, _ := newTestContext(t, "/youtube/WWTcu33u00A")
+		applyQualityHint(c, ext)
+		if q := ext.receivedQualities(); len(q) != 0 {
+			t.Errorf("expected no quality injection, got %v", q)
+		}
+	})
+
+	t.Run("empty quality param is a no-op", func(t *testing.T) {
+		ext := &fakeQualityExtractor{fakeExtractor: fakeExtractor{
+			url:     "https://host/live/index.m3u8",
+			formats: []string{"m3u8"},
+		}}
+		c, _ := newTestContext(t, "/youtube/WWTcu33u00A?quality=")
+		applyQualityHint(c, ext)
+		if q := ext.receivedQualities(); len(q) != 0 {
+			t.Errorf("expected no quality injection, got %v", q)
+		}
+	})
+
+	t.Run("extractor without QualitySetter is ignored", func(t *testing.T) {
+		ext := &fakeExtractor{
+			url:     "https://host/live/index.m3u8",
+			formats: []string{"m3u8"},
+		}
+		c, _ := newTestContext(t, "/kick/somechannel?quality=720p")
+		applyQualityHint(c, ext) // must not panic
+	})
 }
