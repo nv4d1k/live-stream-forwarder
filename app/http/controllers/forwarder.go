@@ -115,8 +115,8 @@ func resolveDesiredFormat(queryFormat string, ext extractor.Extractor) string {
 }
 
 // flvStreamWithCache creates an FLV stream with header caching support.
-func flvStreamWithCache(extractFn stream.ExtractFunc, proxyURL *url.URL, mobile bool, key string) io.ReadCloser {
-	f := httpweb.NewHTTPWebForwarder(proxyURL, mobile)
+func flvStreamWithCache(extractFn stream.ExtractFunc, proxyURL *url.URL, userAgent string, key string) io.ReadCloser {
+	f := httpweb.NewHTTPWebForwarder(proxyURL, userAgent)
 	writerWrapper := func(w io.Writer) io.Writer {
 		return flv.NewHeaderCacheWriter(w, flv.DefaultCache, key)
 	}
@@ -126,10 +126,10 @@ func flvStreamWithCache(extractFn stream.ExtractFunc, proxyURL *url.URL, mobile 
 
 // dispatchStream routes the stream to the appropriate forwarder based on URL
 // scheme and path extension.
-func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, proxyURL *url.URL, mobile bool, key string) {
+func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, proxyURL *url.URL, userAgent string, key string) {
 	switch u.Scheme {
 	case "ws", "wss":
-		f := websocket.NewWebSocketForwarderWithRetry(proxyURL, mobile, extractFn, key)
+		f := websocket.NewWebSocketForwarderWithRetry(proxyURL, userAgent, extractFn, key)
 		err := f.Start(c, u.String())
 		if err != nil {
 			global.Log.WithField("func", "app.http.controllers.dispatchStream").
@@ -138,15 +138,15 @@ func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, pr
 	default:
 		switch {
 		case path.Ext(u.Path) == ".m3u8":
-			h := hls.NewHLSForwarder(proxyURL, mobile)
+			h := hls.NewHLSForwarder(proxyURL, userAgent)
 			s := h.Stream(extractFn)
 			streamToClient(c, s, "video/mp2t")
 		case isDASHManifestURL(u):
-			d := dash.NewDASHForwarder(proxyURL, mobile)
+			d := dash.NewDASHForwarder(proxyURL, userAgent)
 			s := d.Stream(extractFn)
 			streamToClient(c, s, "video/mp4")
 		case path.Ext(u.Path) == ".flv" || path.Ext(u.Path) == ".xs":
-			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, mobile, key), "video/x-flv")
+			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, userAgent, key), "video/x-flv")
 		default:
 			c.String(500, "unsupported format")
 		}
@@ -227,7 +227,7 @@ func Forwarder(c *gin.Context) {
 	// 6. Dispatch to the appropriate forwarder.
 	u, _ := url.Parse(result.URL)
 	key := fmt.Sprintf("%s:%s", platform, room)
-	dispatchStream(c, u, extractFn, proxyURL, entry.Mobile, key)
+	dispatchStream(c, u, extractFn, proxyURL, entry.UserAgent, key)
 }
 
 // formatDeadlockThreshold is how many consecutive format mismatches are

@@ -25,7 +25,6 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewKickLink(rid, proxy)
 		},
-		Mobile:       false,
 		InitialError: 500,
 	})
 }
@@ -54,9 +53,9 @@ func NewKickLink(rid string, proxy *url.URL) (*Link, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.Kick.NewKickLink")
 	k := &Link{rid: rid, apiBase: defaultAPIBase}
 	if proxy != nil {
-		k.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, false)}
+		k.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, "")}
 	} else {
-		k.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
+		k.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, "")}
 	}
 	log.Debugf("creating Kick extractor for room %s", rid)
 	log.Infof("Kick extractor created for room %s", rid)

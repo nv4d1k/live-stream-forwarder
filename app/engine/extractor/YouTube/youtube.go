@@ -24,7 +24,6 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewYouTubeLink(rid, proxy)
 		},
-		Mobile:       false,
 		InitialError: 500,
 	})
 }

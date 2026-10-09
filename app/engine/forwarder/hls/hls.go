@@ -10,23 +10,23 @@ import (
 )
 
 type HLSForwarder struct {
-	proxy  *url.URL
-	hc     *http.Client
-	mobile bool
+	proxy     *url.URL
+	hc        *http.Client
+	userAgent string
 }
 
-func NewHLSForwarder(proxy *url.URL, mobile bool) *HLSForwarder {
+func NewHLSForwarder(proxy *url.URL, userAgent string) *HLSForwarder {
 	log := global.Log.WithField("func", "app.engine.forwarder.hls.NewHLSForwarder")
-	log.Debugf("creating HLSForwarder proxy=%v mobile=%v", proxy, mobile)
+	log.Debugf("creating HLSForwarder proxy=%v userAgent=%q", proxy, userAgent)
 	h := &HLSForwarder{
-		proxy:  proxy,
-		hc:     &http.Client{},
-		mobile: mobile,
+		proxy:     proxy,
+		hc:        &http.Client{},
+		userAgent: userAgent,
 	}
 	if proxy != nil {
-		h.hc.Transport = httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, mobile)
+		h.hc.Transport = httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, userAgent)
 	} else {
-		h.hc.Transport = httpweb.NewAddHeaderTransport(nil, mobile)
+		h.hc.Transport = httpweb.NewAddHeaderTransport(nil, userAgent)
 	}
 	return h
 }

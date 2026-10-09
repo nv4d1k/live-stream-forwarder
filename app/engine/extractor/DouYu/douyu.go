@@ -22,7 +22,6 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewDouyuLink(rid, proxy)
 		},
-		Mobile:       false,
 		InitialError: 400,
 	})
 }
@@ -58,10 +57,10 @@ func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 	dy.t10 = strconv.Itoa(int(time.Now().Unix()))
 	dy.t13 = strconv.Itoa(int(time.Now().UnixMilli()))
 	if proxy != nil {
-		dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxyURL)}, false)}
+		dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxyURL)}, "")}
 		dy.proxy = proxyURL
 	} else {
-		dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
+		dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, "")}
 	}
 	dy.streamParams, err = dy.getLegacyFirstStreamParameters(rid)
 	if err != nil {

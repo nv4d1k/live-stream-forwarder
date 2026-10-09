@@ -19,7 +19,6 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewTwitchLink(rid, proxy)
 		},
-		Mobile:       false,
 		InitialError: 500,
 	})
 }
@@ -35,9 +34,9 @@ func NewTwitchLink(rid string, proxy *url.URL) (*Link, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.Twitch.NewTwitchLink")
 	tw := &Link{rid: rid}
 	if proxy != nil {
-		tw.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, false)}
+		tw.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, "")}
 	} else {
-		tw.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
+		tw.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, "")}
 	}
 	log.Debugf("creating Twitch extractor for room %s", rid)
 	if err := tw.getSigToken(); err != nil {

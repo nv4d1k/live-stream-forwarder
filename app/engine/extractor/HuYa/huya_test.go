@@ -45,8 +45,8 @@ func TestHuYa_Registry(t *testing.T) {
 	if !ok {
 		t.Fatal("huya not registered in extractor.Registry")
 	}
-	if !entry.Mobile {
-		t.Error("Mobile should be true, got false")
+	if entry.UserAgent != global.DEFAULT_MOBILE_USER_AGENT {
+		t.Errorf("UserAgent = %q, want the mobile UA", entry.UserAgent)
 	}
 	if entry.InitialError != 500 {
 		t.Errorf("InitialError = %d, want 500", entry.InitialError)

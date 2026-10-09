@@ -20,7 +20,7 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewHuyaLink(rid, proxy)
 		},
-		Mobile:       true,
+		UserAgent:    global.DEFAULT_MOBILE_USER_AGENT,
 		InitialError: 500,
 	})
 }
@@ -43,9 +43,9 @@ func NewHuyaLink(rid string, proxy *url.URL) (*Link, error) {
 	hy.rid = rid
 	log.WithField("rid", rid).Infoln("creating HuYa extractor")
 	if proxy != nil {
-		hy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, true)}
+		hy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, global.DEFAULT_MOBILE_USER_AGENT)}
 	} else {
-		hy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, true)}
+		hy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, global.DEFAULT_MOBILE_USER_AGENT)}
 	}
 	err = hy.getRoomInfo()
 	if err != nil {

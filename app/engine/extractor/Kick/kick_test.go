@@ -48,8 +48,8 @@ func TestKick_Registry(t *testing.T) {
 	if !ok {
 		t.Fatal("kick not registered in extractor.Registry")
 	}
-	if entry.Mobile {
-		t.Error("Mobile should be false, got true")
+	if entry.UserAgent != "" {
+		t.Errorf("UserAgent should be empty (default desktop UA), got %q", entry.UserAgent)
 	}
 	if entry.InitialError != 500 {
 		t.Errorf("InitialError = %d, want 500", entry.InitialError)

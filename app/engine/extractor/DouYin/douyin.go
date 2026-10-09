@@ -20,7 +20,6 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewDouYinLink(rid, proxy)
 		},
-		Mobile:       false,
 		InitialError: 500,
 	})
 }
@@ -38,9 +37,9 @@ func NewDouYinLink(rid string, proxy *url.URL) (douyin *Link, err error) {
 	douyin.rid = rid
 	log.WithField("rid", rid).Infoln("creating DouYin extractor")
 	if proxy != nil {
-		douyin.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, false)}
+		douyin.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, "")}
 	} else {
-		douyin.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
+		douyin.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, "")}
 	}
 	err = douyin.getCookies()
 	if err != nil {

@@ -15,42 +15,43 @@ import (
 type WebSocketForwarder struct {
 	stopCh    chan struct{}
 	proxy     *url.URL
-	mobile    bool
+	userAgent string
 	extractFn stream.ExtractFunc
 	cacheKey  string
 }
 
-func NewWebSocketForwarder(proxy *url.URL, mobile bool) Foreground {
+func NewWebSocketForwarder(proxy *url.URL, userAgent string) Foreground {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewWebSocketForwarder")
-	log.WithField("mobile", mobile).Debug("creating WebSocketForwarder")
+	log.WithField("userAgent", userAgent).Debug("creating WebSocketForwarder")
 	return &WebSocketForwarder{
-		stopCh: make(chan struct{}),
-		proxy:  proxy,
-		mobile: mobile,
+		stopCh:    make(chan struct{}),
+		proxy:     proxy,
+		userAgent: userAgent,
 	}
 }
 
 // NewWebSocketForwarderWithRetry creates a forwarder that will reconnect
 // using extractFn when the upstream connection fails with a retriable error.
 // cacheKey enables FLV header caching; empty string disables it.
-func NewWebSocketForwarderWithRetry(proxy *url.URL, mobile bool, extractFn stream.ExtractFunc, cacheKey string) Foreground {
+func NewWebSocketForwarderWithRetry(proxy *url.URL, userAgent string, extractFn stream.ExtractFunc, cacheKey string) Foreground {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewWebSocketForwarderWithRetry")
-	log.WithField("mobile", mobile).WithField("cacheKey", cacheKey).Debug("creating WebSocketForwarderWithRetry")
+	log.WithField("userAgent", userAgent).WithField("cacheKey", cacheKey).Debug("creating WebSocketForwarderWithRetry")
 	return &WebSocketForwarder{
 		stopCh:    make(chan struct{}),
 		proxy:     proxy,
-		mobile:    mobile,
+		userAgent: userAgent,
 		extractFn: extractFn,
 		cacheKey:  cacheKey,
 	}
 }
 
 func (s *WebSocketForwarder) httpHeader() http.Header {
-	h := make(http.Header)
-	h.Set("User-Agent", global.DEFAULT_USER_AGENT)
-	if s.mobile {
-		h.Set("User-Agent", global.DEFAULT_MOBILE_USER_AGENT)
+	ua := s.userAgent
+	if ua == "" {
+		ua = global.DEFAULT_USER_AGENT
 	}
+	h := make(http.Header)
+	h.Set("User-Agent", ua)
 	return h
 }
 

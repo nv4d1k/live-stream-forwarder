@@ -69,14 +69,14 @@ func Debug(r *gin.RouterGroup) {
 
 		switch strings.ToLower(c.Param("method")) {
 		case "web", "http":
-			f := httpweb.NewHTTPWebForwarder(proxyURL, false)
+			f := httpweb.NewHTTPWebForwarder(proxyURL, "")
 
 			err = f.Forward(c, headers, string(fu), 0)
 			if err != nil {
 				c.String(400, err.Error())
 			}
 		case "websocket", "ws":
-			f := websocket.NewWebSocketForwarder(proxyURL, false)
+			f := websocket.NewWebSocketForwarder(proxyURL, "")
 			err = f.Start(c, string(fu))
 			if err != nil {
 				c.String(400, err.Error())

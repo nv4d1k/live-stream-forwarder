@@ -16,12 +16,12 @@ type HTTPWebForwarder struct {
 	Client *http.Client
 }
 
-func NewHTTPWebForwarder(proxy *url.URL, mobile bool) *HTTPWebForwarder {
+func NewHTTPWebForwarder(proxy *url.URL, userAgent string) *HTTPWebForwarder {
 	log := global.Log.WithField("func", "app.engine.forwarder.httpweb.NewHTTPWebForwarder")
 	log.Debugln("creating HTTPWebForwarder")
 	h := new(HTTPWebForwarder)
 	h.Client = &http.Client{}
-	h.Client.Transport = NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, mobile)
+	h.Client.Transport = NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, userAgent)
 	return h
 }
 

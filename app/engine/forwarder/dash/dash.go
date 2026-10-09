@@ -11,24 +11,24 @@ import (
 
 // DASHForwarder builds DASHStreams with a proxied, UA-injecting HTTP client.
 type DASHForwarder struct {
-	proxy  *url.URL
-	hc     *http.Client
-	mobile bool
+	proxy     *url.URL
+	hc        *http.Client
+	userAgent string
 }
 
 // NewDASHForwarder creates a DASH forwarder routed through the optional proxy.
-func NewDASHForwarder(proxy *url.URL, mobile bool) *DASHForwarder {
+func NewDASHForwarder(proxy *url.URL, userAgent string) *DASHForwarder {
 	log := global.Log.WithField("func", "app.engine.forwarder.dash.NewDASHForwarder")
-	log.Debugf("creating DASHForwarder proxy=%v mobile=%v", proxy, mobile)
+	log.Debugf("creating DASHForwarder proxy=%v userAgent=%q", proxy, userAgent)
 	d := &DASHForwarder{
-		proxy:  proxy,
-		hc:     &http.Client{},
-		mobile: mobile,
+		proxy:     proxy,
+		hc:        &http.Client{},
+		userAgent: userAgent,
 	}
 	if proxy != nil {
-		d.hc.Transport = httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, mobile)
+		d.hc.Transport = httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, userAgent)
 	} else {
-		d.hc.Transport = httpweb.NewAddHeaderTransport(nil, mobile)
+		d.hc.Transport = httpweb.NewAddHeaderTransport(nil, userAgent)
 	}
 	return d
 }

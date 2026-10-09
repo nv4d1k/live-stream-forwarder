@@ -49,9 +49,14 @@ type Factory func(rid string, proxy *url.URL) (Extractor, error)
 
 // RegistryEntry bundles a Factory with platform-specific forwarding config.
 type RegistryEntry struct {
-	Factory      Factory
-	Mobile       bool // whether to use mobile User-Agent for HTTP transport
-	InitialError int  // HTTP status code for initial extraction errors
+	Factory Factory
+	// UserAgent is the User-Agent injected into the forwarders' HTTP
+	// transports (and the WebSocket handshake). Empty means the default
+	// desktop User-Agent; extractors needing a different UA (e.g. a mobile
+	// one for HuYa, the Android app UA for YouTube's innertube calls)
+	// declare it here or build it into their own request clients.
+	UserAgent    string
+	InitialError int // HTTP status code for initial extraction errors
 }
 
 // Registry maps lowercase platform names to their entries.

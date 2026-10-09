@@ -487,8 +487,8 @@ func TestBiliBili_Registry(t *testing.T) {
 	if !ok {
 		t.Fatal("bilibili not found in extractor.Registry")
 	}
-	if entry.Mobile {
-		t.Error("expected Mobile=false, got true")
+	if entry.UserAgent != "" {
+		t.Errorf("UserAgent should be empty (default desktop UA), got %q", entry.UserAgent)
 	}
 	if entry.InitialError != 500 {
 		t.Errorf("expected InitialError=500, got %d", entry.InitialError)

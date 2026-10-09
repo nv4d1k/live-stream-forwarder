@@ -18,7 +18,6 @@ func init() {
 		Factory: func(rid string, proxy *url.URL) (extractor.Extractor, error) {
 			return NewBiliBiliLink(rid, proxy)
 		},
-		Mobile:       false,
 		InitialError: 500,
 	})
 }
@@ -33,9 +32,9 @@ func NewBiliBiliLink(rid string, proxy *url.URL) (*Link, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.BiliBili.NewBiliBiliLink")
 	l := &Link{rid: rid}
 	if proxy != nil {
-		l.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, false)}
+		l.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, "")}
 	} else {
-		l.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, false)}
+		l.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, "")}
 	}
 	if err := l.resolveRoomID(); err != nil {
 		log.WithError(err).Errorln("failed to resolve room ID")
