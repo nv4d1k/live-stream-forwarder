@@ -186,59 +186,36 @@ func (s *DASHStream) produce() {
 			continue
 		}
 
-		// Fetch one batch per track.
-		aBatch, err := s.fetchBatch(audio, currentHeaders)
-		if err != nil {
-			if isExpiredDASH(err) {
-				log.Warnf("audio batch 403, re-extracting: %s", err.Error())
-				audio, video = nil, nil
-				continue
-			}
-			audio.notFound++
-			if audio.notFound >= notFoundLimit {
-				log.Warnf("audio batch missing %d times, re-extracting: %s", audio.notFound, err.Error())
-				audio, video = nil, nil
-				continue
-			}
-			log.Debugf("audio batch not ready, retrying same sq: %s", err.Error())
-			time.Sleep(pollInterval)
-			continue
-		}
-		audio.notFound = 0
-		vBatch, err := s.fetchBatch(video, currentHeaders)
-		if err != nil {
-			if isExpiredDASH(err) {
-				log.Warnf("video batch 403, re-extracting: %s", err.Error())
-				audio, video = nil, nil
-				continue
-			}
-			video.notFound++
-			if video.notFound >= notFoundLimit {
-				log.Warnf("video batch missing %d times, re-extracting: %s", video.notFound, err.Error())
-				audio, video = nil, nil
-				continue
-			}
-			log.Debugf("video batch not ready, retrying same sq: %s", err.Error())
-			time.Sleep(pollInterval)
-			continue
-		}
-		video.notFound = 0
-
-		// First data round: pipe the merged init (audio ftyp + moov with
-		// both traks). On re-extraction the init is piped again only if it
-		// never made it out (standard fMP4 stream restart semantics).
+		// First data round: probe both inits with lightweight requests —
+		// each response is closed as soon as its first moof arrives, so the
+		// multi-megabyte media payload is never fetched — then merge the
+		// inits and pipe the single combined init.
 		if !initPiped {
-			aInitEnd := firstMoofOffset(aBatch)
-			vInitEnd := firstMoofOffset(vBatch)
-			if aInitEnd < 0 || vInitEnd < 0 {
-				log.Warnln("batch without moof, re-extracting")
-				audio, video = nil, nil
-				continue
+			aInit, aErr := s.fetchInitOnly(audio, currentHeaders)
+			var vInit []byte
+			var vErr error
+			if aErr == nil {
+				vInit, vErr = s.fetchInitOnly(video, currentHeaders)
 			}
-			merged, err := mergeInits(aBatch[:aInitEnd], vBatch[:vInitEnd])
-			if err != nil {
-				log.Warnf("merge inits error: %s", err.Error())
-				audio, video = nil, nil
+			var merged []byte
+			var mErr error
+			if aErr == nil && vErr == nil {
+				merged, mErr = mergeInits(aInit, vInit)
+			}
+			if aErr != nil || vErr != nil || mErr != nil {
+				for _, e := range []error{aErr, vErr, mErr} {
+					if e == nil {
+						continue
+					}
+					if isExpiredDASH(e) || mErr != nil {
+						log.Warnf("init probe error, re-extracting: %s", e.Error())
+						audio, video = nil, nil
+					} else {
+						log.Warnf("init probe error, retrying: %s", e.Error())
+						time.Sleep(pollInterval)
+					}
+					break
+				}
 				continue
 			}
 			if _, err := s.pipe.Write(merged); err != nil {
@@ -248,12 +225,44 @@ func (s *DASHStream) produce() {
 			log.Infoln("piped merged init")
 		}
 
-		// Pipe media moofs: audio keeps track_ID 1, video is rewritten to 2.
-		// Batches overlap the previous ones (each starts at the requested
-		// sq and runs to the live edge), so moofs at or below the cursor's
-		// tfdt are skipped.
-		s.pipeTrackMoofs(aBatch, audio, &audioCursor, false)
-		s.pipeTrackMoofs(vBatch, video, &videoCursor, true)
+		// Stream one batch per track, box-by-box: audio keeps track_ID 1,
+		// video is rewritten to 2, and moofs at or below the track's tfdt
+		// cursor are skipped (batches overlap: each starts at the requested
+		// sq and runs to the live edge).
+		if err := s.pipeTrackBatch(audio, &audioCursor, false, currentHeaders); err != nil {
+			if isExpiredDASH(err) {
+				log.Warnf("audio batch 403, re-extracting: %s", err.Error())
+				audio, video = nil, nil
+				continue
+			}
+			audio.notFound++
+			if audio.notFound >= notFoundLimit {
+				log.Warnf("audio batch failing %d times, re-extracting: %s", audio.notFound, err.Error())
+				audio, video = nil, nil
+				continue
+			}
+			log.Debugf("audio batch error, retrying same sq: %s", err.Error())
+			time.Sleep(pollInterval)
+			continue
+		}
+		audio.notFound = 0
+		if err := s.pipeTrackBatch(video, &videoCursor, true, currentHeaders); err != nil {
+			if isExpiredDASH(err) {
+				log.Warnf("video batch 403, re-extracting: %s", err.Error())
+				audio, video = nil, nil
+				continue
+			}
+			video.notFound++
+			if video.notFound >= notFoundLimit {
+				log.Warnf("video batch failing %d times, re-extracting: %s", video.notFound, err.Error())
+				audio, video = nil, nil
+				continue
+			}
+			log.Debugf("video batch error, retrying same sq: %s", err.Error())
+			time.Sleep(pollInterval)
+			continue
+		}
+		video.notFound = 0
 
 		if s.pipe.Err() != nil {
 			return
@@ -269,71 +278,113 @@ func (s *DASHStream) produce() {
 	}
 }
 
-// fetchBatch downloads the batch response starting at the track's current
-// sequence number (init + every generated moof up to the live edge) and
-// advances the sequence.
-func (s *DASHStream) fetchBatch(t *trackState, headers http.Header) ([]byte, error) {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.DASHStream.fetchBatch")
+// doTrackRequest issues a GET for the track's current sequence number.
+func (s *DASHStream) doTrackRequest(t *trackState, headers http.Header) (*http.Response, error) {
 	u := t.baseURL + "sq/" + strconv.Itoa(t.sq) + "/lmt/1"
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build %s batch request sq=%d: %w", t.name, t.sq, err)
+		return nil, fmt.Errorf("build %s request sq=%d: %w", t.name, t.sq, err)
 	}
 	for k := range headers {
 		req.Header.Set(k, headers.Get(k))
 	}
 	resp, err := s.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch %s batch sq=%d: %w", t.name, t.sq, err)
+		return nil, fmt.Errorf("fetch %s sq=%d: %w", t.name, t.sq, err)
+	}
+	return resp, nil
+}
+
+// fetchInitOnly issues a lightweight request at the track's current sequence
+// and returns just the init part (everything before the first moof: ftyp +
+// moov + emsg). The response is closed as soon as the first moof arrives, so
+// the multi-megabyte media payload is never downloaded. The sequence is not
+// advanced.
+func (s *DASHStream) fetchInitOnly(t *trackState, headers http.Header) ([]byte, error) {
+	log := global.Log.WithField("func", "app.engine.forwarder.dash.DASHStream.fetchInitOnly")
+	resp, err := s.doTrackRequest(t, headers)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch %s batch sq=%d got status %d", t.name, t.sq, resp.StatusCode)
+		return nil, fmt.Errorf("fetch %s init sq=%d got status %d", t.name, t.sq, resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read %s batch sq=%d: %w", t.name, t.sq, err)
+	br := newBoxReader(resp.Body)
+	var init []byte
+	for {
+		box, typ, err := br.next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read %s init sq=%d: %w", t.name, t.sq, err)
+		}
+		if typ == "moof" {
+			break
+		}
+		init = append(init, box...)
 	}
-	t.sq++
-	log.Debugf("fetched %s batch sq=%d (%d bytes, next sq=%d)", t.name, t.sq-1, len(body), t.sq)
-	return body, nil
+	log.Debugf("probed %s init at sq=%d (%d bytes)", t.name, t.sq, len(init))
+	return init, nil
 }
 
-// pipeTrackMoofs writes the moof groups of a batch into the pipe, skipping
-// duplicates by tfdt. video batches get their tfhd track_ID rewritten 1->2.
-func (s *DASHStream) pipeTrackMoofs(batch []byte, t *trackState, cursor *tfdtCursor, video bool) {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.DASHStream.pipeTrackMoofs")
-	var moofs []boxInfo
-	for _, b := range walkBoxes(batch, 0, len(batch)) {
-		if b.typ == "moof" {
-			moofs = append(moofs, b)
-		}
+// pipeTrackBatch streams one batch response into the pipe box-by-box: the
+// repeated init part (everything before the first moof) is skipped, moofs at
+// or below the track's tfdt cursor are dropped, and video moofs get their
+// tfhd track_ID rewritten 1→2. Boxes following a moof (mdat, emsg) inherit
+// its decision. The sequence advances only when the response completes
+// cleanly, so an interrupted batch is re-fetched from the same sq and
+// deduplicated by tfdt.
+func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video bool, headers http.Header) error {
+	log := global.Log.WithField("func", "app.engine.forwarder.dash.DASHStream.pipeTrackBatch")
+	resp, err := s.doTrackRequest(t, headers)
+	if err != nil {
+		return err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("fetch %s batch sq=%d got status %d", t.name, t.sq, resp.StatusCode)
+	}
+	br := newBoxReader(resp.Body)
+	seenMoof := false
+	pipeCurrent := false
 	piped := 0
-	for i, m := range moofs {
-		end := len(batch)
-		if i+1 < len(moofs) {
-			end = moofs[i+1].off
+	for {
+		box, typ, err := br.next()
+		if err == io.EOF {
+			break
 		}
-		tfdt, ok := moofTfdt(batch, m.off, m.size)
-		if ok && cursor.seen && tfdt <= cursor.value {
-			continue
+		if err != nil {
+			return fmt.Errorf("read %s batch sq=%d: %w", t.name, t.sq, err)
 		}
-		if video {
-			rewriteMoofTrackIDs(batch, m.off, end-m.off, 1, 2)
+		if !seenMoof && typ != "moof" {
+			continue // repeated init part of this batch
 		}
-		if _, err := s.pipe.Write(batch[m.off:end]); err != nil {
-			return
+		seenMoof = true
+		if typ == "moof" {
+			tfdt, ok := moofTfdt(box, 0, len(box))
+			pipeCurrent = !(ok && cursor.seen && tfdt <= cursor.value)
+			if pipeCurrent {
+				if video {
+					rewriteMoofTrackIDs(box, 0, len(box), 1, 2)
+				}
+				if ok {
+					cursor.value = tfdt
+					cursor.seen = true
+				}
+				piped++
+			}
 		}
-		if ok {
-			cursor.value = tfdt
-			cursor.seen = true
+		if pipeCurrent {
+			if _, err := s.pipe.Write(box); err != nil {
+				return err
+			}
 		}
-		piped++
 	}
-	if piped > 0 {
-		log.Debugf("piped %d %s moofs (tfdt cursor %d)", piped, t.name, cursor.value)
-	}
+	t.sq++
+	log.Debugf("streamed %s batch sq=%d (%d moofs, next sq=%d)", t.name, t.sq-1, piped, t.sq)
+	return nil
 }
 
 // isExpiredDASH reports whether the error indicates the URLs went stale

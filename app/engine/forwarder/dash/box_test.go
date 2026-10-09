@@ -3,6 +3,7 @@ package dash
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -46,6 +47,21 @@ func mkMoov(nextTrackID uint32, traks ...[]byte) []byte {
 	return mkBox("moov", payload)
 }
 
+// mkTrex: version/flags (4B) + trackID (4B) + default fields.
+func mkTrex(trackID uint32) []byte {
+	p := make([]byte, 24)
+	binary.BigEndian.PutUint32(p[4:8], trackID)
+	return mkBox("trex", p)
+}
+
+func mkMvex(trexes ...[]byte) []byte {
+	var payload []byte
+	for _, t := range trexes {
+		payload = append(payload, t...)
+	}
+	return mkBox("mvex", payload)
+}
+
 func mkEmsg() []byte {
 	return mkBox("emsg", []byte("e"))
 }
@@ -87,10 +103,13 @@ func mkMdat(n int) []byte {
 	return mkBox("mdat", bytes.Repeat([]byte{0xAB}, n))
 }
 
-// mkInitPart builds an init fragment: ftyp + moov(+emsg).
+// mkInitPart builds an init fragment: ftyp + moov(mvhd+trak+mvex/trex)(+emsg).
 func mkInitPart(trackID uint32, withEmsg bool) []byte {
+	moovPayload := append([]byte{}, mkMvhd(trackID+1)...)
+	moovPayload = append(moovPayload, mkTrak(trackID)...)
+	moovPayload = append(moovPayload, mkMvex(mkTrex(trackID))...)
 	out := append([]byte{}, mkFtyp()...)
-	out = append(out, mkMoov(trackID+1, mkTrak(trackID))...)
+	out = append(out, mkBox("moov", moovPayload)...)
 	if withEmsg {
 		out = append(out, mkEmsg()...)
 	}
@@ -105,6 +124,90 @@ func mkBatch(trackID uint32, tfdts []uint64) []byte {
 		out = append(out, mkMdat(16)...)
 	}
 	return out
+}
+
+func TestBoxReader(t *testing.T) {
+	b := mkBatch(1, []uint64{1000, 2000})
+	// Feed it through a slow one-byte-at-a-time reader to prove incremental parsing.
+	r := &slowReader{b: b}
+	br := newBoxReader(r)
+	var types []string
+	for {
+		box, typ, err := br.next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("boxReader.next error: %v", err)
+		}
+		if len(box) < 8 || string(box[4:8]) != typ {
+			t.Fatalf("box type mismatch: %q vs %q", typ, string(box[4:8]))
+		}
+		if binary.BigEndian.Uint32(box[0:4]) != uint32(len(box)) {
+			t.Fatalf("box size mismatch for %s", typ)
+		}
+		types = append(types, typ)
+	}
+	want := []string{"ftyp", "moov", "emsg", "moof", "mdat", "moof", "mdat"}
+	if len(types) != len(want) {
+		t.Fatalf("box sequence = %v, want %v", types, want)
+	}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Errorf("box[%d] = %s, want %s", i, types[i], want[i])
+		}
+	}
+}
+
+func TestBoxReader_OpenEndedBox(t *testing.T) {
+	// A size==0 box extends to the end of the stream.
+	payload := []byte("open-ended payload")
+	b := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint32(b[0:4], 0)
+	copy(b[4:8], "mdat")
+	copy(b[8:], payload)
+	br := newBoxReader(bytes.NewReader(b))
+	box, typ, err := br.next()
+	if err != nil {
+		t.Fatalf("boxReader.next error: %v", err)
+	}
+	if typ != "mdat" || len(box) != len(b) {
+		t.Errorf("open-ended box: typ=%s len=%d, want mdat %d", typ, len(box), len(b))
+	}
+	if _, _, err := br.next(); err != io.EOF {
+		t.Errorf("expected EOF after open-ended box, got %v", err)
+	}
+}
+
+func TestBoxReader_Truncated(t *testing.T) {
+	b := mkBatch(1, []uint64{1000})
+	// Cut the last mdat short.
+	truncated := b[:len(b)-10]
+	br := newBoxReader(bytes.NewReader(truncated))
+	for {
+		_, _, err := br.next()
+		if err == io.EOF {
+			t.Fatal("expected truncation error, got clean EOF")
+		}
+		if err != nil {
+			break // any non-EOF error is acceptable (unexpected EOF)
+		}
+	}
+}
+
+// slowReader hands out one byte at a time to exercise incremental parsing.
+type slowReader struct {
+	b []byte
+	i int
+}
+
+func (r *slowReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.i:r.i+1])
+	r.i++
+	return n, nil
 }
 
 func TestWalkBoxes(t *testing.T) {
@@ -129,20 +232,6 @@ func TestFindBox(t *testing.T) {
 	}
 	if findBox(b, 0, len(b), "ftyp") != nil {
 		t.Error("ftyp should not be found")
-	}
-}
-
-func TestFirstMoofOffset(t *testing.T) {
-	b := mkBatch(1, []uint64{1000, 2000})
-	ftypLen := len(mkFtyp())
-	moovLen := len(mkMoov(2, mkTrak(1)))
-	emsgLen := len(mkEmsg())
-	want := ftypLen + moovLen + emsgLen
-	if got := firstMoofOffset(b); got != want {
-		t.Errorf("firstMoofOffset = %d, want %d", got, want)
-	}
-	if got := firstMoofOffset(mkFtyp()); got != -1 {
-		t.Errorf("firstMoofOffset without moof = %d, want -1", got)
 	}
 }
 
@@ -255,6 +344,23 @@ func TestMergeInits(t *testing.T) {
 	mvhd := findBox(merged, moov.off+8, moov.off+moov.size, "mvhd")
 	if got := binary.BigEndian.Uint32(merged[mvhd.off+8+96 : mvhd.off+8+100]); got != 3 {
 		t.Errorf("next_track_ID = %d, want 3", got)
+	}
+
+	// The merged mvex must carry a trex for both tracks: audio 1 and the
+	// renumbered video 2. Without the video trex, strict demuxers (ffmpeg,
+	// PotPlayer) reject the fragments ("could not find corresponding trex").
+	mvex := findBox(merged, moov.off+8, moov.off+moov.size, "mvex")
+	if mvex == nil {
+		t.Fatal("merged moov has no mvex")
+	}
+	var trexIDs []uint32
+	for _, b := range walkBoxes(merged, mvex.off+8, mvex.off+mvex.size) {
+		if b.typ == "trex" {
+			trexIDs = append(trexIDs, binary.BigEndian.Uint32(merged[b.off+8+4:b.off+8+8]))
+		}
+	}
+	if len(trexIDs) != 2 || trexIDs[0] != 1 || trexIDs[1] != 2 {
+		t.Errorf("merged mvex trex ids = %v, want [1 2]", trexIDs)
 	}
 }
 

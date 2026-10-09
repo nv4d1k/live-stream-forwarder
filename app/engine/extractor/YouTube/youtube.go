@@ -131,7 +131,7 @@ func (l *Link) SupportedFormats() []string {
 }
 
 func (l *Link) DefaultFormat() string {
-	return "m3u8"
+	return "dash"
 }
 
 // expireAtFromManifestURL extracts the expiry timestamp from a googlevideo

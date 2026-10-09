@@ -69,8 +69,8 @@ func TestYouTube_SupportedFormats(t *testing.T) {
 
 func TestYouTube_DefaultFormat(t *testing.T) {
 	l := &Link{}
-	if got := l.DefaultFormat(); got != "m3u8" {
-		t.Errorf("DefaultFormat() = %q, want %q", got, "m3u8")
+	if got := l.DefaultFormat(); got != "dash" {
+		t.Errorf("DefaultFormat() = %q, want %q", got, "dash")
 	}
 }
 

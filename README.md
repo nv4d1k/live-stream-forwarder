@@ -94,12 +94,18 @@ Available formats by platform:
 | DouYin | flv, m3u8 | flv |
 | Twitch | m3u8 | m3u8 |
 | Kick | m3u8 | m3u8 |
-| YouTube | m3u8, dash | m3u8 |
+| YouTube | m3u8, dash | dash |
 
-YouTube's `dash` format forwards the fMP4 DASH representations (audio and video interleaved in one stream, up to 1080p60 and beyond where the stream provides it):
+YouTube defaults to the `dash` format — it forwards the fMP4 DASH representations (audio and video interleaved in one stream, up to 1080p60 and beyond where the stream provides it):
 
 ```
-http://<address>:<port>/youtube/WWTcu33u00A?format=dash
+http://<address>:<port>/youtube/WWTcu33u00A
+```
+
+Pass `?format=m3u8` to switch back to the HLS path (muxed TS variants):
+
+```
+http://<address>:<port>/youtube/WWTcu33u00A?format=m3u8
 ```
 
 > **Note**: `?quality=` currently applies to the `m3u8` format only; `dash` always picks the highest-bandwidth representations.
