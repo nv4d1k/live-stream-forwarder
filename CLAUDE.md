@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git Conventions
+
+- **All commits must be GPG-signed.** Never use `--no-gpg-sign`. If signing fails in a non-interactive environment (pinentry cannot prompt for the passphrase), stop and hand the commit command to the user to run in an interactive terminal — do not fall back to an unsigned commit. Note the `!` prefix in a Claude session has no TTY either; the durable fix on this Mac is `brew install pinentry-mac` plus `pinentry-program <path>/pinentry-mac` in `~/.gnupg/gpg-agent.conf` (GUI prompt works from any environment).
+- Commit messages in English, format: `type(scope): description`.
+
 ## Build & Run
 
 ```bash
