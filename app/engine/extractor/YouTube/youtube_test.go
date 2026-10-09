@@ -30,9 +30,12 @@ const testHLSURL = "https://manifest.googlevideo.com/api/manifest/hls_variant/ex
 
 // playerJSON builds a minimal innertube player response body.
 func playerJSON(playability, reason string, isLive bool, hlsURL string) string {
-	return fmt.Sprintf(`{"videoDetails":{"videoId":"WWTcu33u00A","title":"Test Live","isLive":%t},"playabilityStatus":{"status":%q,"reason":%q},"streamingData":{"hlsManifestUrl":%q}}`,
-		isLive, playability, reason, hlsURL)
+	return fmt.Sprintf(`{"videoDetails":{"videoId":"WWTcu33u00A","title":"Test Live","isLive":%t},"playabilityStatus":{"status":%q,"reason":%q},"streamingData":{"hlsManifestUrl":%q,"dashManifestUrl":%q}}`,
+		isLive, playability, reason, hlsURL, testDashURL)
 }
+
+// testDashURL mimics the shape of a YouTube DASH manifest URL.
+const testDashURL = "https://manifest.googlevideo.com/api/manifest/dash/expire/1791572998/ei/test/ip/2401:2660:1/id/WWTcu33u00A.1/playbackurl/default/sparams/expire,source/signature/x.mpd"
 
 // newPlayerServer spins up a mock innertube player API that answers every
 // request with the given status and body, recording requests for assertions.
@@ -53,7 +56,7 @@ func newPlayerServer(t *testing.T, status int, body string) (*httptest.Server, *
 func TestYouTube_SupportedFormats(t *testing.T) {
 	l := &Link{}
 	formats := l.SupportedFormats()
-	expected := []string{"m3u8"}
+	expected := []string{"m3u8", "dash"}
 	if len(formats) != len(expected) {
 		t.Fatalf("expected %d formats, got %d", len(expected), len(formats))
 	}
@@ -390,5 +393,41 @@ func TestYouTube_SetQuality(t *testing.T) {
 	l.SetQuality("480p")
 	if l.quality != "480p" {
 		t.Errorf("quality = %q, want %q", l.quality, "480p")
+	}
+}
+
+func TestYouTube_Extract_Dash(t *testing.T) {
+	ts, _ := newPlayerServer(t, http.StatusOK, playerJSON("OK", "", true, testHLSURL))
+
+	l := &Link{rid: "WWTcu33u00A", client: ts.Client(), apiBase: ts.URL}
+	result, err := l.Extract("dash")
+	if err != nil {
+		t.Fatalf("Extract(dash) returned error: %v", err)
+	}
+	if result.URL != testDashURL {
+		t.Errorf("URL = %q, want %q", result.URL, testDashURL)
+	}
+	// ExpireAt parsed from the /expire/<unix>/ path segment.
+	if result.ExpireAt == nil {
+		t.Fatal("ExpireAt should not be nil")
+	}
+	expectedExpire := time.Unix(1791572998, 0)
+	if result.ExpireAt.Unix() != expectedExpire.Unix() {
+		t.Errorf("ExpireAt = %v, want %v", result.ExpireAt, expectedExpire)
+	}
+}
+
+func TestYouTube_Extract_DashNoManifest(t *testing.T) {
+	noDash := fmt.Sprintf(`{"videoDetails":{"videoId":"WWTcu33u00A","title":"Test Live","isLive":true},"playabilityStatus":{"status":"OK"},"streamingData":{"hlsManifestUrl":%q}}`, testHLSURL)
+	ts, _ := newPlayerServer(t, http.StatusOK, noDash)
+
+	l := &Link{rid: "WWTcu33u00A", client: ts.Client(), apiBase: ts.URL}
+	_, err := l.Extract("dash")
+	if err == nil {
+		t.Fatal("Extract(dash) should return error when no DASH manifest is present")
+	}
+	// The HLS path still works for the same response.
+	if _, err := l.Extract("m3u8"); err != nil {
+		t.Errorf("Extract(m3u8) should still succeed: %v", err)
 	}
 }

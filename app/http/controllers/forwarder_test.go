@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 
@@ -266,6 +267,35 @@ func TestBuildExtractFn_XSIsFlvFamily(t *testing.T) {
 	}
 	if fmts := ext.lastFormats(); len(fmts) != 2 || fmts[1] != "flv" {
 		t.Errorf("expected retry with initial format flv, got %v", fmts)
+	}
+}
+
+// TestFormatFromURL verifies URL-to-format classification, including the
+// YouTube DASH manifest whose URL ends in a signature rather than ".mpd".
+func TestFormatFromURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"websocket", "wss://host/live/test.xs", "ws"},
+		{"flv", "https://host/live/test.flv", "flv"},
+		{"xs is flv family", "https://host/live/test.xs?txSecret=s", "flv"},
+		{"m3u8", "https://host/live/index.m3u8", "m3u8"},
+		{"mpd file", "https://host/manifest/file/x.mpd", "dash"},
+		{"youtube dash manifest path", "https://manifest.googlevideo.com/api/manifest/dash/expire/1791572998/ei/x/sig/AE0s2JYwRQ", "dash"},
+		{"no extension", "https://host/live/stream", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			u, err := url.Parse(tc.raw)
+			if err != nil {
+				t.Fatalf("parse url: %v", err)
+			}
+			if got := formatFromURL(u); got != tc.want {
+				t.Errorf("formatFromURL(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
 	}
 }
 

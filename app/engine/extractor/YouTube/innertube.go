@@ -61,7 +61,8 @@ type playerResponse struct {
 		Reason string `json:"reason"`
 	} `json:"playabilityStatus"`
 	StreamingData struct {
-		HLSManifestURL string `json:"hlsManifestUrl"`
+		HLSManifestURL  string `json:"hlsManifestUrl"`
+		DASHManifestURL string `json:"dashManifestUrl"`
 	} `json:"streamingData"`
 }
 

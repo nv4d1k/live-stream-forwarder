@@ -22,6 +22,7 @@ import (
 	_ "github.com/nv4d1k/live-stream-forwarder/app/engine/extractor/YouTube"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/dash"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/hls"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
@@ -60,6 +61,13 @@ func streamToClient(c *gin.Context, r io.ReadCloser, contentType string) {
 	}
 }
 
+// isDASHManifestURL reports whether the URL points at a DASH manifest.
+// YouTube's manifest URLs end in a signature segment rather than ".mpd",
+// so the manifest path is matched as well.
+func isDASHManifestURL(u *url.URL) bool {
+	return path.Ext(u.Path) == ".mpd" || strings.Contains(u.Path, "/api/manifest/dash/")
+}
+
 // formatFromURL determines the stream format from a URL: "ws", "flv",
 // "m3u8", etc. DouYu's p2p=2 ".xs" URLs serve the same http-flv payload as
 // ".flv", so they normalize to "flv" — dispatchStream already routes both to
@@ -69,6 +77,9 @@ func formatFromURL(u *url.URL) string {
 	switch u.Scheme {
 	case "ws", "wss":
 		return "ws"
+	}
+	if isDASHManifestURL(u) {
+		return "dash"
 	}
 	if ext := path.Ext(u.Path); ext == ".xs" {
 		return "flv"
@@ -125,12 +136,16 @@ func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, pr
 				Errorf("forward ws(s) stream error: %s\n", err.Error())
 		}
 	default:
-		switch path.Ext(u.Path) {
-		case ".m3u8":
+		switch {
+		case path.Ext(u.Path) == ".m3u8":
 			h := hls.NewHLSForwarder(proxyURL, mobile)
 			s := h.Stream(extractFn)
 			streamToClient(c, s, "video/mp2t")
-		case ".flv", ".xs":
+		case isDASHManifestURL(u):
+			d := dash.NewDASHForwarder(proxyURL, mobile)
+			s := d.Stream(extractFn)
+			streamToClient(c, s, "video/mp4")
+		case path.Ext(u.Path) == ".flv" || path.Ext(u.Path) == ".xs":
 			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, mobile, key), "video/x-flv")
 		default:
 			c.String(500, "unsupported format")

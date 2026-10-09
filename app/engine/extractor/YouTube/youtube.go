@@ -69,11 +69,13 @@ func (l *Link) SetQuality(quality string) {
 	l.quality = quality
 }
 
-// Extract resolves the live HLS manifest URL via the innertube player API.
-// The returned ExpireAt comes from the manifest URL's /expire/<unix>/ path
-// segment (about 6 hours out), letting the HLS forwarder re-extract before
-// the URL goes stale.
-func (l *Link) Extract(_ string) (*extractor.Result, error) {
+// Extract resolves the live manifest URL via the innertube player API.
+// format selects the manifest family: "dash" returns the DASH MPD (fMP4
+// representations up to and beyond 1080p), anything else returns the HLS
+// master playlist (muxed TS variants up to 1080p). The returned ExpireAt
+// comes from the manifest URL's /expire/<unix>/ path segment (about 6 hours
+// out), letting the forwarders re-extract before the URL goes stale.
+func (l *Link) Extract(format string) (*extractor.Result, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.YouTube.Extract")
 
 	pr, err := l.getPlayer()
@@ -90,13 +92,24 @@ func (l *Link) Extract(_ string) (*extractor.Result, error) {
 		log.Warnf("room %s is not live", l.rid)
 		return nil, fmt.Errorf("room %s is not live", l.rid)
 	}
-	if pr.StreamingData.HLSManifestURL == "" {
-		log.Warnf("room %s has no HLS manifest URL", l.rid)
-		return nil, fmt.Errorf("room %s has no HLS manifest URL", l.rid)
+
+	var manifestURL string
+	if format == "dash" {
+		if pr.StreamingData.DASHManifestURL == "" {
+			log.Warnf("room %s has no DASH manifest URL", l.rid)
+			return nil, fmt.Errorf("room %s has no DASH manifest URL", l.rid)
+		}
+		manifestURL = pr.StreamingData.DASHManifestURL
+	} else {
+		if pr.StreamingData.HLSManifestURL == "" {
+			log.Warnf("room %s has no HLS manifest URL", l.rid)
+			return nil, fmt.Errorf("room %s has no HLS manifest URL", l.rid)
+		}
+		manifestURL = pr.StreamingData.HLSManifestURL
 	}
 
-	result := &extractor.Result{URL: pr.StreamingData.HLSManifestURL}
-	if exp, err := expireAtFromManifestURL(pr.StreamingData.HLSManifestURL); err == nil {
+	result := &extractor.Result{URL: manifestURL}
+	if exp, err := expireAtFromManifestURL(manifestURL); err == nil {
 		result.ExpireAt = exp
 		log.Debugf("manifest URL expires at %s for room %s", exp.Format(time.RFC3339), l.rid)
 	} else {
@@ -115,7 +128,7 @@ func (l *Link) Extract(_ string) (*extractor.Result, error) {
 }
 
 func (l *Link) SupportedFormats() []string {
-	return []string{"m3u8"}
+	return []string{"m3u8", "dash"}
 }
 
 func (l *Link) DefaultFormat() string {
