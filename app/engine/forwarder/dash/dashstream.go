@@ -14,9 +14,16 @@ import (
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
-// pollInterval is the pause between track batch fetches (YouTube's MPD
-// minimumUpdatePeriod is 2s). Package-level so tests can shorten it.
+// pollInterval is the pause used on retryable errors (segment not generated
+// yet, transient failures). Package-level so tests can shorten it.
 var pollInterval = 2 * time.Second
+
+// sessionRenewInterval is how long an innertube-signed DASH session is used
+// before its BaseURLs are proactively renewed. YouTube serves each session
+// for only ~30 seconds (the playlist_duration parameter) and then answers
+// 403 for every request; renewing ahead of that keeps the stream gapless.
+// Package-level so tests can shorten it.
+var sessionRenewInterval = 24 * time.Second
 
 // startBackoff is how many segments behind the live edge a stream starts,
 // trading a few seconds of latency for a stable starting point.
@@ -143,6 +150,34 @@ func (s *DASHStream) produce() {
 		}
 	}()
 
+	var sessionRenewAt time.Time
+	// renew swaps fresh BaseURLs in before the ~30s session window lapses,
+	// keeping the sq and tfdt cursors so the client stream never notices.
+	renew := func() bool {
+		result, err := s.extractFn(previous)
+		if err != nil {
+			log.Warnf("renew extract error: %s", err.Error())
+			return false
+		}
+		previous = result
+		currentHeaders = result.Headers
+		info, err := fetchAndParseMPD(s.hc, result.URL, result.Headers)
+		if err != nil {
+			log.Warnf("renew MPD fetch error: %s", err.Error())
+			return false
+		}
+		audioRep, videoRep, err := pickRepresentations(info)
+		if err != nil {
+			log.Warnf("renew representation pick error: %s", err.Error())
+			return false
+		}
+		audio.baseURL = audioRep.BaseURL
+		video.baseURL = videoRep.BaseURL
+		sessionRenewAt = time.Now().Add(sessionRenewInterval)
+		log.Debugf("renewed session BaseURLs (audio itag=%s, video itag=%s)", audioRep.ID, videoRep.ID)
+		return true
+	}
+
 	for {
 		// Check if client disconnected.
 		if s.pipe.Err() != nil {
@@ -183,6 +218,18 @@ func (s *DASHStream) produce() {
 			// only when one has never been sent.
 			log.Debugf("tracks ready: audio itag=%s sq=%d, video itag=%s sq=%d", audioRep.ID, audio.sq, videoRep.ID, video.sq)
 			scheduleRefresh(result.ExpireAt)
+			sessionRenewAt = time.Now().Add(sessionRenewInterval)
+			continue
+		}
+
+		// Proactive session renewal: an innertube-signed DASH session serves
+		// only ~30s (playlist_duration) before every request turns 403. Swap
+		// fresh BaseURLs just before that instead of waiting for the gap a
+		// passive 403 recovery would leave.
+		if time.Now().After(sessionRenewAt) {
+			if !renew() {
+				time.Sleep(pollInterval)
+			}
 			continue
 		}
 
@@ -225,40 +272,48 @@ func (s *DASHStream) produce() {
 			log.Infoln("piped merged init")
 		}
 
-		// Stream one batch per track, box-by-box: audio keeps track_ID 1,
-		// video is rewritten to 2, and moofs at or below the track's tfdt
-		// cursor are skipped (batches overlap: each starts at the requested
-		// sq and runs to the live edge).
-		if err := s.pipeTrackBatch(audio, &audioCursor, false, currentHeaders); err != nil {
-			if isExpiredDASH(err) {
-				log.Warnf("audio batch 403, re-extracting: %s", err.Error())
+		// Stream one batch per track in parallel, box-by-box: audio keeps
+		// track_ID 1, video is rewritten to 2, and moofs at or below the
+		// track's tfdt cursor are skipped. Requests ahead of the live edge
+		// are held by the server until the segment is generated, which paces
+		// the loop naturally — no fixed sleep.
+		aErrCh := make(chan error, 1)
+		vErrCh := make(chan error, 1)
+		go func() { aErrCh <- s.pipeTrackBatch(audio, &audioCursor, false, currentHeaders) }()
+		go func() { vErrCh <- s.pipeTrackBatch(video, &videoCursor, true, currentHeaders) }()
+		aErr := <-aErrCh
+		vErr := <-vErrCh
+
+		if aErr != nil {
+			if isExpiredDASH(aErr) {
+				log.Warnf("audio batch 403, re-extracting: %s", aErr.Error())
 				audio, video = nil, nil
 				continue
 			}
 			audio.notFound++
 			if audio.notFound >= notFoundLimit {
-				log.Warnf("audio batch failing %d times, re-extracting: %s", audio.notFound, err.Error())
+				log.Warnf("audio batch failing %d times, re-extracting: %s", audio.notFound, aErr.Error())
 				audio, video = nil, nil
 				continue
 			}
-			log.Debugf("audio batch error, retrying same sq: %s", err.Error())
+			log.Debugf("audio batch error, retrying same sq: %s", aErr.Error())
 			time.Sleep(pollInterval)
 			continue
 		}
 		audio.notFound = 0
-		if err := s.pipeTrackBatch(video, &videoCursor, true, currentHeaders); err != nil {
-			if isExpiredDASH(err) {
-				log.Warnf("video batch 403, re-extracting: %s", err.Error())
+		if vErr != nil {
+			if isExpiredDASH(vErr) {
+				log.Warnf("video batch 403, re-extracting: %s", vErr.Error())
 				audio, video = nil, nil
 				continue
 			}
 			video.notFound++
 			if video.notFound >= notFoundLimit {
-				log.Warnf("video batch failing %d times, re-extracting: %s", video.notFound, err.Error())
+				log.Warnf("video batch failing %d times, re-extracting: %s", video.notFound, vErr.Error())
 				audio, video = nil, nil
 				continue
 			}
-			log.Debugf("video batch error, retrying same sq: %s", err.Error())
+			log.Debugf("video batch error, retrying same sq: %s", vErr.Error())
 			time.Sleep(pollInterval)
 			continue
 		}
@@ -268,12 +323,14 @@ func (s *DASHStream) produce() {
 			return
 		}
 
-		// Wait before the next poll, but wake early if the token needs refreshing.
+		// Re-extract immediately if the signed URL is about to expire
+		// (ExpireAt lead time); otherwise keep pulling — the server-side
+		// hold on future segments paces the loop.
 		select {
 		case <-s.refreshCh:
 			log.Infoln("token refresh triggered, re-extracting")
 			audio, video = nil, nil
-		case <-time.After(pollInterval):
+		default:
 		}
 	}
 }
@@ -329,13 +386,16 @@ func (s *DASHStream) fetchInitOnly(t *trackState, headers http.Header) ([]byte, 
 	return init, nil
 }
 
-// pipeTrackBatch streams one batch response into the pipe box-by-box: the
-// repeated init part (everything before the first moof) is skipped, moofs at
-// or below the track's tfdt cursor are dropped, and video moofs get their
-// tfhd track_ID rewritten 1→2. Boxes following a moof (mdat, emsg) inherit
-// its decision. The sequence advances only when the response completes
-// cleanly, so an interrupted batch is re-fetched from the same sq and
-// deduplicated by tfdt.
+// pipeTrackBatch streams one batch response into the pipe: the repeated
+// init part (everything before the first moof) is skipped, moofs at or
+// below the track's tfdt cursor are dropped, and video moofs get their
+// tfhd track_ID rewritten 1→2. A moof and the boxes following it (mdat,
+// emsg) are piped as one atomic group — with both tracks writing in
+// parallel, a moof and its mdat must never be separated by the other
+// track's boxes or stream demuxers read past the fragment boundaries
+// (ffmpeg reports "Invalid NAL unit size"). The sequence advances only
+// when the response completes cleanly, so an interrupted batch is
+// re-fetched from the same sq and deduplicated by tfdt.
 func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video bool, headers http.Header) error {
 	log := global.Log.WithField("func", "app.engine.forwarder.dash.DASHStream.pipeTrackBatch")
 	resp, err := s.doTrackRequest(t, headers)
@@ -350,6 +410,17 @@ func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video boo
 	seenMoof := false
 	pipeCurrent := false
 	piped := 0
+	var group []byte
+	flushGroup := func() error {
+		if len(group) == 0 {
+			return nil
+		}
+		if _, err := s.pipe.Write(group); err != nil {
+			return err
+		}
+		group = nil
+		return nil
+	}
 	for {
 		box, typ, err := br.next()
 		if err == io.EOF {
@@ -363,6 +434,11 @@ func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video boo
 		}
 		seenMoof = true
 		if typ == "moof" {
+			// Start of a new group: the previous one must be flushed
+			// before this moof can be considered.
+			if err := flushGroup(); err != nil {
+				return err
+			}
 			tfdt, ok := moofTfdt(box, 0, len(box))
 			pipeCurrent = !(ok && cursor.seen && tfdt <= cursor.value)
 			if pipeCurrent {
@@ -373,14 +449,16 @@ func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video boo
 					cursor.value = tfdt
 					cursor.seen = true
 				}
+				group = append(group, box...)
 				piped++
 			}
+		} else if pipeCurrent {
+			// mdat/emsg belonging to the current moof group.
+			group = append(group, box...)
 		}
-		if pipeCurrent {
-			if _, err := s.pipe.Write(box); err != nil {
-				return err
-			}
-		}
+	}
+	if err := flushGroup(); err != nil {
+		return err
 	}
 	t.sq++
 	log.Debugf("streamed %s batch sq=%d (%d moofs, next sq=%d)", t.name, t.sq-1, piped, t.sq)

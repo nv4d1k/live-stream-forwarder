@@ -22,8 +22,9 @@ import (
 func TestMain(m *testing.M) {
 	global.Log = logrus.New()
 	global.Log.SetLevel(logrus.DebugLevel)
-	// Speed up polling so tests run fast.
+	// Speed up polling and session renewal so tests run fast.
 	pollInterval = 50 * time.Millisecond
+	sessionRenewInterval = 300 * time.Millisecond
 	os.Exit(m.Run())
 }
 
@@ -342,5 +343,112 @@ func TestDASHStream_ExtractErrorRetries(t *testing.T) {
 	}
 	if calls < 2 {
 		t.Errorf("extract retried %d times, want >= 2", calls)
+	}
+}
+
+// TestDASHStream_ProactiveRenewal verifies that the BaseURLs are renewed
+// before the ~30s session window lapses (YouTube 403s every request of a
+// session after that) without resetting the tfdt cursors: the stream stays
+// gapless with no duplicated moofs across renewals.
+func TestDASHStream_ProactiveRenewal(t *testing.T) {
+	tss := newTrackServer()
+	var mpdReqs atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/mpd":
+			mpdReqs.Add(1)
+			w.Write(testMPD(strings.TrimSuffix(tsServerBase, "/")))
+		case strings.HasPrefix(r.URL.Path, "/audio140/"):
+			tss.mu.Lock()
+			sq, _ := strconv.Atoi(strings.SplitN(strings.TrimPrefix(r.URL.Path, "/audio140/sq/"), "/", 2)[0])
+			tfdts, ok := tss.audioSQ[sq]
+			tss.mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Write(mkBatch(1, tfdts))
+		case strings.HasPrefix(r.URL.Path, "/video299/"):
+			tss.mu.Lock()
+			sq, _ := strconv.Atoi(strings.SplitN(strings.TrimPrefix(r.URL.Path, "/video299/sq/"), "/", 2)[0])
+			tfdts, ok := tss.videoSQ[sq]
+			tss.mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Write(mkBatch(1, tfdts))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	tsServerBase = ts.URL
+
+	var extractCount atomic.Int32
+	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		extractCount.Add(1)
+		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
+	}
+
+	s := NewDASHStream(extractFn, ts.Client())
+	// sessionRenewInterval is 300ms in tests; run long enough for several
+	// renewals plus re-extraction cycles triggered by exhausted sq data.
+	data := readAllUntilClose(t, s, 2500*time.Millisecond)
+
+	if extractCount.Load() < 3 {
+		t.Fatalf("extractFn called %d times, want >= 3 (initial + renewals/re-extractions)", extractCount.Load())
+	}
+	if mpdReqs.Load() < 3 {
+		t.Fatalf("MPD fetched %d times, want >= 3", mpdReqs.Load())
+	}
+
+	// The stream must stay well-formed across renewals: exactly one init
+	// (ftyp+moov pair per re-extraction is fine, but they must be paired)
+	// and no tfdt ever piped twice per track.
+	boxes := walkBoxes(data, 0, len(data))
+	ftypCount, moovCount := 0, 0
+	seen := map[uint32]map[uint64]bool{}
+	var lastByTrack map[uint32]uint64 = map[uint32]uint64{}
+	for _, b := range boxes {
+		switch b.typ {
+		case "ftyp":
+			ftypCount++
+		case "moov":
+			moovCount++
+		case "moof":
+			trackID := uint32(0)
+			for _, traf := range walkBoxes(data, b.off+8, b.off+b.size) {
+				if traf.typ != "traf" {
+					continue
+				}
+				for _, tb := range walkBoxes(data, traf.off+8, traf.off+traf.size) {
+					if tb.typ == "tfhd" {
+						trackID = binary.BigEndian.Uint32(data[tb.off+8+4 : tb.off+8+8])
+					}
+				}
+			}
+			tfdt, ok := moofTfdt(data, b.off, b.size)
+			if !ok {
+				continue
+			}
+			if seen[trackID] == nil {
+				seen[trackID] = map[uint64]bool{}
+			}
+			if seen[trackID][tfdt] {
+				t.Errorf("tfdt %d on track %d piped twice across renewals", tfdt, trackID)
+			}
+			seen[trackID][tfdt] = true
+			if prev, ok := lastByTrack[trackID]; ok && tfdt <= prev {
+				t.Errorf("tfdt %d on track %d not increasing (prev %d)", tfdt, trackID, prev)
+			}
+			lastByTrack[trackID] = tfdt
+		}
+	}
+	if ftypCount < 1 {
+		t.Fatal("no init piped at all")
+	}
+	if moovCount != ftypCount {
+		t.Errorf("ftyp=%d moov=%d, want paired", ftypCount, moovCount)
 	}
 }
