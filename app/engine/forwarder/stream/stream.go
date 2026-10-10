@@ -114,11 +114,17 @@ func (s *Stream) Wait() error {
 // retryBackoffBase (doubling up to retryBackoffMax) before the next attempt,
 // so repeated upstream/API failures can never hot-loop against the platform
 // API (which would trigger rate-limiting and turn a transient hiccup into an
-// outage). Package-level var so tests can shorten it.
+// outage). Package-level atomics so tests can shorten them while producers
+// from earlier tests are still winding down (plain vars raced under -race).
 var (
-	retryBackoffBase = 1 * time.Second
-	retryBackoffMax  = 10 * time.Second
+	retryBackoffBase atomic.Int64 // time.Duration
+	retryBackoffMax  atomic.Int64 // time.Duration
 )
+
+func init() {
+	retryBackoffBase.Store(int64(time.Second))
+	retryBackoffMax.Store(int64(10 * time.Second))
+}
 
 // refreshLeadTime is how long before ExtractResult.ExpireAt the producer
 // proactively drops the upstream connection and re-extracts a fresh URL,
@@ -128,7 +134,7 @@ const refreshLeadTime = 60 * time.Second
 func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 	log := global.Log.WithField("func", "app.engine.forwarder.stream.produce")
 	var previous *ExtractResult
-	backoff := retryBackoffBase
+	backoff := time.Duration(retryBackoffBase.Load())
 
 	for {
 		result, err := extractFn(previous)
@@ -171,7 +177,7 @@ func (s *Stream) produce(extractFn ExtractFunc, fetchFn FetchFunc) {
 		}
 
 		previous = result
-		backoff = retryBackoffBase // extract + fetch succeeded, reset backoff
+		backoff = time.Duration(retryBackoffBase.Load()) // extract + fetch succeeded, reset backoff
 
 		var w io.Writer = s.pipe
 		if s.writerWrapper != nil {
@@ -244,8 +250,8 @@ func (s *Stream) sleepBackoff(backoff *time.Duration) bool {
 	t := time.NewTimer(*backoff)
 	defer t.Stop()
 	*backoff *= 2
-	if *backoff > retryBackoffMax {
-		*backoff = retryBackoffMax
+	if max := time.Duration(retryBackoffMax.Load()); *backoff > max {
+		*backoff = max
 	}
 	select {
 	case <-t.C:

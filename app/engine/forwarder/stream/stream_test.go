@@ -306,9 +306,10 @@ func (b *blockingReadCloser) Close() error {
 
 func setTestBackoff(t *testing.T, base time.Duration) {
 	t.Helper()
-	old := retryBackoffBase
-	retryBackoffBase = base
-	t.Cleanup(func() { retryBackoffBase = old })
+	// Atomic store: producers from earlier tests can still be winding
+	// down and reading the variable when the next test starts, which -race
+	// flags on a plain variable.
+	retryBackoffBase.Store(int64(base))
 }
 
 // TestStreamRetriableReconnect verifies that an upstream error mid-copy
