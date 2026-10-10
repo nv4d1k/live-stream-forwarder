@@ -22,9 +22,12 @@ import (
 func TestMain(m *testing.M) {
 	global.Log = logrus.New()
 	global.Log.SetLevel(logrus.DebugLevel)
-	// Speed up polling and session renewal so tests run fast.
+	// Speed up polling, session renewal and failure limits so tests run fast.
 	pollInterval = 50 * time.Millisecond
 	sessionRenewInterval = 300 * time.Millisecond
+	notFoundLimit = 3
+	renewBackoffBase = 150 * time.Millisecond
+	renewBackoffMax = 400 * time.Millisecond
 	os.Exit(m.Run())
 }
 
@@ -343,6 +346,193 @@ func TestDASHStream_ExtractErrorRetries(t *testing.T) {
 	}
 	if calls < 2 {
 		t.Errorf("extract retried %d times, want >= 2", calls)
+	}
+}
+
+// TestDASHStream_SegmentRequestURLNoLmt verifies the segment request URL
+// carries no lmt suffix. The MPD's lmt values are per-segment version
+// markers; a hardcoded /lmt/1 is rejected with 404 by part of the CDN fleet
+// (observed on live rooms where the audio itag happened to tolerate it but
+// every video itag 404'd), so the request must be issued without one.
+func TestDASHStream_SegmentRequestURLNoLmt(t *testing.T) {
+	var gotPath atomic.Value
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath.Store(r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	s := &DASHStream{hc: ts.Client()}
+	tr := &trackState{name: "video", baseURL: ts.URL + "/video299/", sq: 100}
+	resp, err := s.doTrackRequest(tr, nil)
+	if err != nil {
+		t.Fatalf("doTrackRequest error: %v", err)
+	}
+	resp.Body.Close()
+	if p, _ := gotPath.Load().(string); p != "/video299/sq/100" {
+		t.Errorf("request path = %q, want /video299/sq/100 (no lmt suffix)", p)
+	}
+}
+
+// TestDASHStream_InitProbe404Reextracts verifies that an init probe failing
+// with a non-expired error (404) does not retry forever: after notFoundLimit
+// consecutive failures the stream re-extracts, so a probe that can never
+// succeed cycles through fresh extractions instead of leaving the client
+// waiting on an empty response forever.
+func TestDASHStream_InitProbe404Reextracts(t *testing.T) {
+	tss := newTrackServer()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/mpd":
+			w.Write(testMPD(strings.TrimSuffix(tsServerBase, "/")))
+		case strings.HasPrefix(r.URL.Path, "/audio140/"):
+			tss.mu.Lock()
+			sq, _ := strconv.Atoi(strings.SplitN(strings.TrimPrefix(r.URL.Path, "/audio140/sq/"), "/", 2)[0])
+			tfdts, ok := tss.audioSQ[sq]
+			tss.mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Write(mkBatch(1, tfdts))
+		case strings.HasPrefix(r.URL.Path, "/video299/"):
+			// Video always 404s: the init probe can never succeed.
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	tsServerBase = ts.URL
+
+	var extractCount atomic.Int32
+	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		extractCount.Add(1)
+		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
+	}
+
+	s := NewDASHStream(extractFn, ts.Client())
+	_ = readAllUntilClose(t, s, 1500*time.Millisecond)
+
+	// notFoundLimit = 3 in tests: the probe fails 3 times (~150ms), then the
+	// stream must re-extract. At least one re-extraction within 1.5s proves
+	// the loop has an exit.
+	if extractCount.Load() < 2 {
+		t.Fatalf("extractFn called %d times, want >= 2 (init probe 404 must re-extract after notFoundLimit failures)", extractCount.Load())
+	}
+}
+
+// TestDASHStream_RenewFailureBackoff verifies that a failing renewal (the
+// extractFn erroring during the periodic session renew) backs off
+// exponentially instead of hammering the extractor API every pollInterval.
+func TestDASHStream_RenewFailureBackoff(t *testing.T) {
+	// The track server serves every sq (tfdt derived from sq, strictly
+	// increasing), so batches never 404 and only renewals call the extractor.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/mpd":
+			w.Write(testMPD(strings.TrimSuffix(tsServerBase, "/")))
+		case strings.HasPrefix(r.URL.Path, "/audio140/"):
+			sq, _ := strconv.Atoi(strings.SplitN(strings.TrimPrefix(r.URL.Path, "/audio140/sq/"), "/", 2)[0])
+			w.Write(mkBatch(1, []uint64{uint64(sq) * 1000}))
+		case strings.HasPrefix(r.URL.Path, "/video299/"):
+			sq, _ := strconv.Atoi(strings.SplitN(strings.TrimPrefix(r.URL.Path, "/video299/sq/"), "/", 2)[0])
+			w.Write(mkBatch(1, []uint64{uint64(sq) * 20000}))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	tsServerBase = ts.URL
+
+	var calls atomic.Int32
+	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		if calls.Add(1) == 1 {
+			return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
+		}
+		return nil, fmt.Errorf("renew extract boom")
+	}
+
+	s := NewDASHStream(extractFn, ts.Client())
+	_ = readAllUntilClose(t, s, 1500*time.Millisecond)
+
+	// sessionRenewInterval = 300ms in tests. Without backoff the loop would
+	// retry every pollInterval (50ms) — ~25 calls in 1.5s. With the backoff
+	// ladder (150ms→300ms→400ms cap) expect at most ~6.
+	if n := calls.Load(); n > 6 {
+		t.Errorf("extractFn called %d times in 1.5s, want <= 6 (renew failure must back off)", n)
+	}
+}
+
+// TestDASHStream_InitProbesRunInParallel verifies the audio and video init
+// probes are issued concurrently: with every upstream response delayed by
+// 300ms, serial probes would first pipe media at ~900ms (probe+probe+batch)
+// while parallel probes make it ~600ms (probe∥probe, then batch).
+func TestDASHStream_InitProbesRunInParallel(t *testing.T) {
+	const delay = 300 * time.Millisecond
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/mpd":
+			w.Write(testMPD(strings.TrimSuffix(tsServerBase, "/")))
+		case strings.HasPrefix(r.URL.Path, "/audio140/"), strings.HasPrefix(r.URL.Path, "/video299/"):
+			sq, _ := strconv.Atoi(strings.SplitN(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/audio140/"), "/video299/"), "sq/"), "/", 2)[0])
+			time.Sleep(delay)
+			if strings.HasPrefix(r.URL.Path, "/audio140/") {
+				w.Write(mkBatch(1, []uint64{uint64(sq) * 1000}))
+			} else {
+				w.Write(mkBatch(1, []uint64{uint64(sq) * 20000}))
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	tsServerBase = ts.URL
+
+	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
+	}
+
+	start := time.Now()
+	s := NewDASHStream(extractFn, ts.Client())
+	defer s.Close()
+
+	// Read until a moof followed by an mdat shows up; that is the earliest
+	// observable proof that the merged init was piped and the first media
+	// batch completed.
+	firstMedia := make(chan time.Duration, 1)
+	go func() {
+		buf := make([]byte, 65536)
+		var acc []byte
+		for {
+			n, err := s.Read(buf)
+			acc = append(acc, buf[:n]...)
+			sawMoof := false
+			for _, b := range walkBoxes(acc, 0, len(acc)) {
+				if b.typ == "moof" {
+					sawMoof = true
+				} else if b.typ == "mdat" && sawMoof {
+					firstMedia <- time.Since(start)
+					return
+				}
+			}
+			if err != nil {
+				firstMedia <- time.Hour
+				return
+			}
+		}
+	}()
+
+	select {
+	case d := <-firstMedia:
+		// Parallel: ~2×delay (probe pair overlapped, then the batch pair
+		// overlapped). Serial: ~3×delay. The 2.5×delay threshold separates
+		// them with margin on both sides.
+		if threshold := time.Duration(float64(delay) * 2.5); d > threshold {
+			t.Errorf("first media after %s, probes look serial (threshold %s)", d, threshold)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no media produced within 5s")
 	}
 }
 

@@ -31,7 +31,20 @@ const startBackoff = 3
 
 // notFoundLimit is how many consecutive 404 batches (segment not generated
 // yet) are tolerated before re-extracting, catching streams that ended.
-const notFoundLimit = 30
+// It also bounds the init probe retries, so a probe that can never succeed
+// (e.g. a bad segment URL) cycles through fresh extractions instead of
+// leaving the client waiting on an empty response forever.
+// Package-level var so tests can shorten it.
+var notFoundLimit = 30
+
+// Renew failure backoff bounds: a failed session renewal (extract or MPD
+// fetch error) reschedules the next attempt at renewBackoffBase, doubling up
+// to renewBackoffMax, so an upstream outage cannot hot-loop the innertube
+// API. Package-level vars so tests can shorten them.
+var (
+	renewBackoffBase = 2 * time.Second
+	renewBackoffMax  = 10 * time.Second
+)
 
 // DASHStream continuously fetches the audio and video representations of a
 // YouTube live DASH manifest and pipes an interleaved two-track fMP4 stream
@@ -151,8 +164,11 @@ func (s *DASHStream) produce() {
 	}()
 
 	var sessionRenewAt time.Time
+	var renewFails int
 	// renew swaps fresh BaseURLs in before the ~30s session window lapses,
 	// keeping the sq and tfdt cursors so the client stream never notices.
+	// A failed renewal reschedules itself with a doubling backoff (reset on
+	// success), so an upstream outage cannot hot-loop the innertube API.
 	renew := func() bool {
 		result, err := s.extractFn(previous)
 		if err != nil {
@@ -173,6 +189,7 @@ func (s *DASHStream) produce() {
 		}
 		audio.baseURL = audioRep.BaseURL
 		video.baseURL = videoRep.BaseURL
+		renewFails = 0
 		sessionRenewAt = time.Now().Add(sessionRenewInterval)
 		log.Debugf("renewed session BaseURLs (audio itag=%s, video itag=%s)", audioRep.ID, videoRep.ID)
 		return true
@@ -225,10 +242,12 @@ func (s *DASHStream) produce() {
 		// Proactive session renewal: an innertube-signed DASH session serves
 		// only ~30s (playlist_duration) before every request turns 403. Swap
 		// fresh BaseURLs just before that instead of waiting for the gap a
-		// passive 403 recovery would leave.
+		// passive 403 recovery would leave. Failures back off exponentially.
 		if time.Now().After(sessionRenewAt) {
 			if !renew() {
-				time.Sleep(pollInterval)
+				renewFails++
+				backoff := min(renewBackoffBase<<min(renewFails-1, 3), renewBackoffMax)
+				sessionRenewAt = time.Now().Add(backoff)
 			}
 			continue
 		}
@@ -236,39 +255,61 @@ func (s *DASHStream) produce() {
 		// First data round: probe both inits with lightweight requests —
 		// each response is closed as soon as its first moof arrives, so the
 		// multi-megabyte media payload is never fetched — then merge the
-		// inits and pipe the single combined init.
+		// inits and pipe the single combined init. Both probes run in
+		// parallel: the merged init needs both anyway, and serializing them
+		// would stack two upstream round trips onto the client's
+		// time-to-first-byte.
 		if !initPiped {
-			aInit, aErr := s.fetchInitOnly(audio, currentHeaders)
-			var vInit []byte
-			var vErr error
-			if aErr == nil {
-				vInit, vErr = s.fetchInitOnly(video, currentHeaders)
-			}
-			var merged []byte
-			var mErr error
-			if aErr == nil && vErr == nil {
-				merged, mErr = mergeInits(aInit, vInit)
-			}
-			if aErr != nil || vErr != nil || mErr != nil {
-				for _, e := range []error{aErr, vErr, mErr} {
-					if e == nil {
-						continue
+			aErrCh := make(chan error, 1)
+			aInitCh := make(chan []byte, 1)
+			go func() {
+				init, err := s.fetchInitOnly(audio, currentHeaders)
+				aInitCh <- init
+				aErrCh <- err
+			}()
+			vInit, vErr := s.fetchInitOnly(video, currentHeaders)
+			aInit, aErr := <-aInitCh, <-aErrCh
+			// A track-level probe failure: a 403 means the session went
+			// stale — re-extract immediately. Anything else (typically 404,
+			// segment not generated yet) counts toward the track's notFound
+			// budget and re-extracts once exhausted, so a probe that can
+			// never succeed cannot spin here forever with the client
+			// waiting on an empty response.
+			if aErr != nil || vErr != nil {
+				if isExpiredDASH(aErr) || isExpiredDASH(vErr) {
+					err := aErr
+					if err == nil {
+						err = vErr
 					}
-					if isExpiredDASH(e) || mErr != nil {
-						log.Warnf("init probe error, re-extracting: %s", e.Error())
+					log.Warnf("init probe expired, re-extracting: %s", err.Error())
+					audio, video = nil, nil
+				} else {
+					failed, err := audio, aErr
+					if aErr == nil {
+						failed, err = video, vErr
+					}
+					failed.notFound++
+					if failed.notFound >= notFoundLimit {
+						log.Warnf("init probe failing %d times, re-extracting: %s", failed.notFound, err.Error())
 						audio, video = nil, nil
 					} else {
-						log.Warnf("init probe error, retrying: %s", e.Error())
+						log.Warnf("init probe error, retrying: %s", err.Error())
 						time.Sleep(pollInterval)
 					}
-					break
 				}
+				continue
+			}
+			merged, mErr := mergeInits(aInit, vInit)
+			if mErr != nil {
+				log.Warnf("init merge error, re-extracting: %s", mErr.Error())
+				audio, video = nil, nil
 				continue
 			}
 			if _, err := s.pipe.Write(merged); err != nil {
 				return
 			}
 			initPiped = true
+			audio.notFound, video.notFound = 0, 0
 			log.Infoln("piped merged init")
 		}
 
@@ -336,8 +377,12 @@ func (s *DASHStream) produce() {
 }
 
 // doTrackRequest issues a GET for the track's current sequence number.
+// The URL deliberately carries no /lmt/<n> suffix: the MPD's lmt values are
+// per-segment version markers, and requesting a stale one (a hardcoded
+// /lmt/1 once the segment was re-processed) is rejected with 404 by part of
+// the CDN fleet. Without the suffix the server serves the current version.
 func (s *DASHStream) doTrackRequest(t *trackState, headers http.Header) (*http.Response, error) {
-	u := t.baseURL + "sq/" + strconv.Itoa(t.sq) + "/lmt/1"
+	u := t.baseURL + "sq/" + strconv.Itoa(t.sq)
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build %s request sq=%d: %w", t.name, t.sq, err)
