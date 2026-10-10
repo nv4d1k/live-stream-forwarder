@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/bmff"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
@@ -299,7 +300,7 @@ func (s *DASHStream) produce() {
 				}
 				continue
 			}
-			merged, mErr := mergeInits(aInit, vInit)
+			merged, mErr := bmff.MergeInits(aInit, vInit)
 			if mErr != nil {
 				log.Warnf("init merge error, re-extracting: %s", mErr.Error())
 				audio, video = nil, nil
@@ -412,10 +413,10 @@ func (s *DASHStream) fetchInitOnly(t *trackState, headers http.Header) ([]byte, 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch %s init sq=%d got status %d", t.name, t.sq, resp.StatusCode)
 	}
-	br := newBoxReader(resp.Body)
+	br := bmff.NewBoxReader(resp.Body)
 	var init []byte
 	for {
-		box, typ, err := br.next()
+		box, typ, err := br.Next()
 		if err == io.EOF {
 			break
 		}
@@ -451,7 +452,7 @@ func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video boo
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("fetch %s batch sq=%d got status %d", t.name, t.sq, resp.StatusCode)
 	}
-	br := newBoxReader(resp.Body)
+	br := bmff.NewBoxReader(resp.Body)
 	seenMoof := false
 	pipeCurrent := false
 	piped := 0
@@ -467,7 +468,7 @@ func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video boo
 		return nil
 	}
 	for {
-		box, typ, err := br.next()
+		box, typ, err := br.Next()
 		if err == io.EOF {
 			break
 		}
@@ -484,11 +485,11 @@ func (s *DASHStream) pipeTrackBatch(t *trackState, cursor *tfdtCursor, video boo
 			if err := flushGroup(); err != nil {
 				return err
 			}
-			tfdt, ok := moofTfdt(box, 0, len(box))
+			tfdt, ok := bmff.MoofTfdt(box, 0, len(box))
 			pipeCurrent = !(ok && cursor.seen && tfdt <= cursor.value)
 			if pipeCurrent {
 				if video {
-					rewriteMoofTrackIDs(box, 0, len(box), 1, 2)
+					bmff.RewriteMoofTrackIDs(box, 0, len(box), 1, 2)
 				}
 				if ok {
 					cursor.value = tfdt

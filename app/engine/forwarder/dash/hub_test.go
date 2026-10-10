@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/bmff"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/fanout"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 )
 
@@ -65,46 +67,13 @@ func readFor(t *testing.T, r io.ReadCloser, d time.Duration) []byte {
 // of the init part.
 func firstMoofOffset(t *testing.T, data []byte) int {
 	t.Helper()
-	for _, b := range walkBoxes(data, 0, len(data)) {
-		if b.typ == "moof" {
-			return b.off
+	for _, b := range bmff.WalkBoxes(data, 0, len(data)) {
+		if b.Typ == "moof" {
+			return b.Off
 		}
 	}
 	t.Fatalf("no moof in %d bytes of data", len(data))
 	return 0
-}
-
-func TestHub_GetOrCreateShares(t *testing.T) {
-	hub := &Hub{streams: map[string]*SharedStream{}}
-	calls := 0
-	mk := func() *DASHStream {
-		calls++
-		return &DASHStream{pipe: stream.NewPipe(), done: make(chan struct{})}
-	}
-	a := hub.GetOrCreate("k", mk)
-	b := hub.GetOrCreate("k", mk)
-	if a != b {
-		t.Error("same key must return the same SharedStream")
-	}
-	c := hub.GetOrCreate("other", mk)
-	if c == a {
-		t.Error("different key must return a different SharedStream")
-	}
-	if calls != 2 {
-		t.Errorf("core created %d times, want 2 (one per key)", calls)
-	}
-	if n := hub.Len(); n != 2 {
-		t.Errorf("hub size = %d, want 2", n)
-	}
-	// Teardown removes only the matching instance.
-	hub.remove("k", c) // wrong instance for key "k"
-	if n := hub.Len(); n != 2 {
-		t.Errorf("hub size after removing wrong instance = %d, want 2", n)
-	}
-	hub.remove("k", a)
-	if n := hub.Len(); n != 1 {
-		t.Errorf("hub size after teardown = %d, want 1", n)
-	}
 }
 
 // TestSharedStream_FanOutSharedUpstream verifies the core property of the
@@ -115,13 +84,13 @@ func TestSharedStream_FanOutSharedUpstream(t *testing.T) {
 	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
 		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
 	}
-	hub := NewHub()
+	hub := fanout.NewHub()
 	hub.IdleGrace = 10 * time.Second
 	var cores atomic.Int32
-	ss := hub.GetOrCreate("yt:room:proxy", func() *DASHStream {
+	ss := hub.GetOrCreate("yt:room:proxy", func() io.ReadCloser {
 		cores.Add(1)
 		return NewDASHStream(extractFn, ts.Client())
-	})
+	}, fanout.FramingBMFF)
 
 	sub1 := ss.Subscribe()
 	data1 := readFor(t, sub1, 700*time.Millisecond)
@@ -144,7 +113,7 @@ func TestSharedStream_FanOutSharedUpstream(t *testing.T) {
 		if off := firstMoofOffset(t, d); off != initLen {
 			t.Errorf("%s init length = %d, want %d (merged init replay)", name, off, initLen)
 		}
-		if n := len(walkBoxes(d, 0, len(d))); n < 4 {
+		if n := len(bmff.WalkBoxes(d, 0, len(d))); n < 4 {
 			t.Errorf("%s produced only %d boxes, want a real stream", name, n)
 		}
 	}
@@ -163,11 +132,11 @@ func TestSharedStream_LateSubscriberReplay(t *testing.T) {
 	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
 		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
 	}
-	hub := NewHub()
+	hub := fanout.NewHub()
 	hub.IdleGrace = 10 * time.Second
-	ss := hub.GetOrCreate("k", func() *DASHStream {
+	ss := hub.GetOrCreate("k", func() io.ReadCloser {
 		return NewDASHStream(extractFn, ts.Client())
-	})
+	}, fanout.FramingBMFF)
 
 	sub1 := ss.Subscribe()
 	data1 := readFor(t, sub1, 800*time.Millisecond) // fill the replay buffer
@@ -187,11 +156,11 @@ func TestSharedStream_LateSubscriberReplay(t *testing.T) {
 	// First group in sub2's media: up to (excluding) its second moof.
 	firstGroupEnd := len(media2)
 	moofSeen := 0
-	for _, b := range walkBoxes(data2, init2, len(data2)) {
-		if b.typ == "moof" {
+	for _, b := range bmff.WalkBoxes(data2, init2, len(data2)) {
+		if b.Typ == "moof" {
 			moofSeen++
 			if moofSeen == 2 {
-				firstGroupEnd = b.off - init2
+				firstGroupEnd = b.Off - init2
 				break
 			}
 		}
@@ -217,11 +186,11 @@ func TestSharedStream_IdleTeardown(t *testing.T) {
 	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
 		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
 	}
-	hub := NewHub()
+	hub := fanout.NewHub()
 	hub.IdleGrace = 200 * time.Millisecond
-	ss := hub.GetOrCreate("k", func() *DASHStream {
+	ss := hub.GetOrCreate("k", func() io.ReadCloser {
 		return NewDASHStream(extractFn, ts.Client())
-	})
+	}, fanout.FramingBMFF)
 
 	sub := ss.Subscribe()
 	_ = readFor(t, sub, 400*time.Millisecond)
@@ -249,11 +218,11 @@ func TestSharedStream_ProducerEndClosesSubs(t *testing.T) {
 	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
 		return nil, fmt.Errorf("room moved to p2p: %w", stream.ErrFormatDeadlock)
 	}
-	hub := NewHub()
+	hub := fanout.NewHub()
 	hub.IdleGrace = 10 * time.Second
-	ss := hub.GetOrCreate("k", func() *DASHStream {
+	ss := hub.GetOrCreate("k", func() io.ReadCloser {
 		return NewDASHStream(extractFn, http.DefaultClient)
-	})
+	}, fanout.FramingBMFF)
 	sub1 := ss.Subscribe()
 	sub2 := ss.Subscribe()
 
@@ -295,7 +264,7 @@ func TestHub_SubscribeExisting(t *testing.T) {
 	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
 		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
 	}
-	hub := NewHub()
+	hub := fanout.NewHub()
 
 	// No stream yet: must return nil so the caller falls back to a full
 	// extraction + dispatch.
@@ -304,9 +273,9 @@ func TestHub_SubscribeExisting(t *testing.T) {
 		t.Fatal("SubscribeExisting must return nil when no stream exists")
 	}
 
-	ss := hub.GetOrCreate("k", func() *DASHStream {
+	ss := hub.GetOrCreate("k", func() io.ReadCloser {
 		return NewDASHStream(extractFn, ts.Client())
-	})
+	}, fanout.FramingBMFF)
 	r := hub.SubscribeExisting("k")
 	if r == nil {
 		t.Fatal("SubscribeExisting returned nil for a live stream")
@@ -358,11 +327,11 @@ func TestSharedStream_PublishesGroupWithoutWaitingForOtherTrack(t *testing.T) {
 	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
 		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
 	}
-	hub := NewHub()
+	hub := fanout.NewHub()
 	hub.IdleGrace = 10 * time.Second
-	ss := hub.GetOrCreate("k", func() *DASHStream {
+	ss := hub.GetOrCreate("k", func() io.ReadCloser {
 		return NewDASHStream(extractFn, ts.Client())
-	})
+	}, fanout.FramingBMFF)
 
 	// Read with a deadline shorter than the video delay: by then the
 	// merged init and the first audio group must have been published.
@@ -384,8 +353,8 @@ func TestSharedStream_PublishesGroupWithoutWaitingForOtherTrack(t *testing.T) {
 			}
 			// Stop once a full moof+mdat pair is past the init.
 			sawMoof, sawMdat := false, false
-			for _, b := range walkBoxes(acc, 0, len(acc)) {
-				switch b.typ {
+			for _, b := range bmff.WalkBoxes(acc, 0, len(acc)) {
+				switch b.Typ {
 				case "moof":
 					sawMoof = true
 				case "mdat":
@@ -420,12 +389,12 @@ func TestSharedStream_SlowSubscriberKicked(t *testing.T) {
 	extractFn := func(*stream.ExtractResult) (*stream.ExtractResult, error) {
 		return &stream.ExtractResult{URL: ts.URL + "/mpd"}, nil
 	}
-	hub := NewHub()
+	hub := fanout.NewHub()
 	hub.IdleGrace = 10 * time.Second
 	hub.KickBytes = 4096
-	ss := hub.GetOrCreate("k", func() *DASHStream {
+	ss := hub.GetOrCreate("k", func() io.ReadCloser {
 		return NewDASHStream(extractFn, ts.Client())
-	})
+	}, fanout.FramingBMFF)
 
 	slow := ss.Subscribe()
 	// Never read from slow; let the producer push data well past the kick
@@ -447,13 +416,13 @@ func TestSharedStream_SlowSubscriberKicked(t *testing.T) {
 	}
 	if kickErr == nil {
 		t.Error("slow subscriber should have been kicked, stream never ended")
-	} else if !errors.Is(kickErr, errSlowSubscriber) {
-		t.Errorf("slow subscriber ended with %v, want errSlowSubscriber", kickErr)
+	} else if !errors.Is(kickErr, fanout.ErrSlowSubscriber) {
+		t.Errorf("slow subscriber ended with %v, want fanout.ErrSlowSubscriber", kickErr)
 	}
 
 	fast := ss.Subscribe()
 	data := readFor(t, fast, 400*time.Millisecond)
-	if n := len(walkBoxes(data, 0, len(data))); n < 4 {
+	if n := len(bmff.WalkBoxes(data, 0, len(data))); n < 4 {
 		t.Errorf("healthy subscriber broke after kick: %d bytes, %d boxes", len(data), n)
 	}
 }

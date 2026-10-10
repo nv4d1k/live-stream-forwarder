@@ -1,4 +1,4 @@
-package dash
+package bmff
 
 import (
 	"bytes"
@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// ---- minimal ISO-BMFF builders used across the dash package tests ----
+// ---- minimal ISO-BMFF builders used across the bmff tests ----
 
 func mkBox(typ string, payload []byte) []byte {
 	b := make([]byte, 8+len(payload))
@@ -130,15 +130,15 @@ func TestBoxReader(t *testing.T) {
 	b := mkBatch(1, []uint64{1000, 2000})
 	// Feed it through a slow one-byte-at-a-time reader to prove incremental parsing.
 	r := &slowReader{b: b}
-	br := newBoxReader(r)
+	br := NewBoxReader(r)
 	var types []string
 	for {
-		box, typ, err := br.next()
+		box, typ, err := br.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			t.Fatalf("boxReader.next error: %v", err)
+			t.Fatalf("BoxReader.Next error: %v", err)
 		}
 		if len(box) < 8 || string(box[4:8]) != typ {
 			t.Fatalf("box type mismatch: %q vs %q", typ, string(box[4:8]))
@@ -166,15 +166,15 @@ func TestBoxReader_OpenEndedBox(t *testing.T) {
 	binary.BigEndian.PutUint32(b[0:4], 0)
 	copy(b[4:8], "mdat")
 	copy(b[8:], payload)
-	br := newBoxReader(bytes.NewReader(b))
-	box, typ, err := br.next()
+	br := NewBoxReader(bytes.NewReader(b))
+	box, typ, err := br.Next()
 	if err != nil {
-		t.Fatalf("boxReader.next error: %v", err)
+		t.Fatalf("BoxReader.Next error: %v", err)
 	}
 	if typ != "mdat" || len(box) != len(b) {
 		t.Errorf("open-ended box: typ=%s len=%d, want mdat %d", typ, len(box), len(b))
 	}
-	if _, _, err := br.next(); err != io.EOF {
+	if _, _, err := br.Next(); err != io.EOF {
 		t.Errorf("expected EOF after open-ended box, got %v", err)
 	}
 }
@@ -183,9 +183,9 @@ func TestBoxReader_Truncated(t *testing.T) {
 	b := mkBatch(1, []uint64{1000})
 	// Cut the last mdat short.
 	truncated := b[:len(b)-10]
-	br := newBoxReader(bytes.NewReader(truncated))
+	br := NewBoxReader(bytes.NewReader(truncated))
 	for {
-		_, _, err := br.next()
+		_, _, err := br.Next()
 		if err == io.EOF {
 			t.Fatal("expected truncation error, got clean EOF")
 		}
@@ -212,52 +212,52 @@ func (r *slowReader) Read(p []byte) (int, error) {
 
 func TestWalkBoxes(t *testing.T) {
 	b := append(append([]byte{}, mkFtyp()...), mkMoof(1, 1000)...)
-	boxes := walkBoxes(b, 0, len(b))
+	boxes := WalkBoxes(b, 0, len(b))
 	if len(boxes) != 2 {
 		t.Fatalf("expected 2 boxes, got %d", len(boxes))
 	}
-	if boxes[0].typ != "ftyp" || boxes[1].typ != "moof" {
-		t.Errorf("box types = %q,%q want ftyp,moof", boxes[0].typ, boxes[1].typ)
+	if boxes[0].Typ != "ftyp" || boxes[1].Typ != "moof" {
+		t.Errorf("box types = %q,%q want ftyp,moof", boxes[0].Typ, boxes[1].Typ)
 	}
-	if boxes[0].off != 0 || boxes[1].off != boxes[0].size {
-		t.Errorf("offsets wrong: %d,%d", boxes[0].off, boxes[1].off)
+	if boxes[0].Off != 0 || boxes[1].Off != boxes[0].Size {
+		t.Errorf("offsets wrong: %d,%d", boxes[0].Off, boxes[1].Off)
 	}
 }
 
 func TestFindBox(t *testing.T) {
 	b := mkMoov(3, mkTrak(1))
-	moov := findBox(b, 0, len(b), "moov")
+	moov := FindBox(b, 0, len(b), "moov")
 	if moov == nil {
 		t.Fatal("moov not found")
 	}
-	if findBox(b, 0, len(b), "ftyp") != nil {
+	if FindBox(b, 0, len(b), "ftyp") != nil {
 		t.Error("ftyp should not be found")
 	}
 }
 
 // findNested walks a box path (e.g. "moof","traf","tfhd") and returns the
 // deepest box, or nil.
-func findNested(b []byte, off, end int, path ...string) *boxInfo {
-	cur := findBox(b, off, end, path[0])
+func findNested(b []byte, off, end int, path ...string) *BoxInfo {
+	cur := FindBox(b, off, end, path[0])
 	for _, p := range path[1:] {
 		if cur == nil {
 			return nil
 		}
-		cur = findBox(b, cur.off+8, cur.off+cur.size, p)
+		cur = FindBox(b, cur.Off+8, cur.Off+cur.Size, p)
 	}
 	return cur
 }
 
 func TestRewriteTrakTrackID(t *testing.T) {
 	trak := mkTrak(1)
-	if err := rewriteTrakTrackID(trak, 0, len(trak), 2); err != nil {
-		t.Fatalf("rewriteTrakTrackID error: %v", err)
+	if err := RewriteTrakTrackID(trak, 0, len(trak), 2); err != nil {
+		t.Fatalf("RewriteTrakTrackID error: %v", err)
 	}
 	tkhd := findNested(trak, 0, len(trak), "trak", "tkhd")
 	if tkhd == nil {
 		t.Fatal("tkhd not found inside trak")
 	}
-	got := binary.BigEndian.Uint32(trak[tkhd.off+8+12 : tkhd.off+8+16])
+	got := binary.BigEndian.Uint32(trak[tkhd.Off+8+12 : tkhd.Off+8+16])
 	if got != 2 {
 		t.Errorf("track_ID after rewrite = %d, want 2", got)
 	}
@@ -265,7 +265,7 @@ func TestRewriteTrakTrackID(t *testing.T) {
 
 func TestRewriteMoofTrackIDs(t *testing.T) {
 	moof := mkMoof(1, 1000)
-	n := rewriteMoofTrackIDs(moof, 0, len(moof), 1, 2)
+	n := RewriteMoofTrackIDs(moof, 0, len(moof), 1, 2)
 	if n != 1 {
 		t.Fatalf("rewritten tfhd count = %d, want 1", n)
 	}
@@ -273,33 +273,33 @@ func TestRewriteMoofTrackIDs(t *testing.T) {
 	if tfhd == nil {
 		t.Fatal("tfhd not found inside moof/traf")
 	}
-	got := binary.BigEndian.Uint32(moof[tfhd.off+8+4 : tfhd.off+8+8])
+	got := binary.BigEndian.Uint32(moof[tfhd.Off+8+4 : tfhd.Off+8+8])
 	if got != 2 {
 		t.Errorf("tfhd track_ID = %d, want 2", got)
 	}
 	// No match for a different source ID.
-	if n := rewriteMoofTrackIDs(moof, 0, len(moof), 9, 2); n != 0 {
+	if n := RewriteMoofTrackIDs(moof, 0, len(moof), 9, 2); n != 0 {
 		t.Errorf("rewrite from 9 should match nothing, got %d", n)
 	}
 }
 
 func TestMoofTfdt(t *testing.T) {
 	moof := mkMoof(1, 0xBEEF)
-	got, ok := moofTfdt(moof, 0, len(moof))
+	got, ok := MoofTfdt(moof, 0, len(moof))
 	if !ok || got != 0xBEEF {
-		t.Errorf("moofTfdt = %d,%v want 0xBEEF,true", got, ok)
+		t.Errorf("MoofTfdt = %d,%v want 0xBEEF,true", got, ok)
 	}
 	// Version 0 (4-byte) tfdt.
 	traf := mkBox("traf", append(append([]byte{}, mkTfhd(1)...), mkTfdtV0(777)...))
 	moofV0 := mkBox("moof", append(append([]byte{}, mkMfhd(1)...), traf...))
-	got, ok = moofTfdt(moofV0, 0, len(moofV0))
+	got, ok = MoofTfdt(moofV0, 0, len(moofV0))
 	if !ok || got != 777 {
-		t.Errorf("moofTfdt v0 = %d,%v want 777,true", got, ok)
+		t.Errorf("MoofTfdt v0 = %d,%v want 777,true", got, ok)
 	}
 	// No tfdt at all.
 	bare := mkBox("moof", mkMfhd(1))
-	if _, ok := moofTfdt(bare, 0, len(bare)); ok {
-		t.Error("moofTfdt should report false without tfdt")
+	if _, ok := MoofTfdt(bare, 0, len(bare)); ok {
+		t.Error("MoofTfdt should report false without tfdt")
 	}
 }
 
@@ -307,15 +307,15 @@ func TestMergeInits(t *testing.T) {
 	audioInit := mkInitPart(1, true) // ftyp + moov(mvhd next=2, trak id=1) + emsg
 	videoInit := mkInitPart(1, true) // same shape for the video track
 
-	merged, err := mergeInits(audioInit, videoInit)
+	merged, err := MergeInits(audioInit, videoInit)
 	if err != nil {
-		t.Fatalf("mergeInits error: %v", err)
+		t.Fatalf("MergeInits error: %v", err)
 	}
 
-	boxes := walkBoxes(merged, 0, len(merged))
+	boxes := WalkBoxes(merged, 0, len(merged))
 	var types []string
 	for _, b := range boxes {
-		types = append(types, b.typ)
+		types = append(types, b.Typ)
 	}
 	// expect: ftyp, moov, emsg, emsg
 	if len(types) != 4 || types[0] != "ftyp" || types[1] != "moov" || types[2] != "emsg" || types[3] != "emsg" {
@@ -323,10 +323,10 @@ func TestMergeInits(t *testing.T) {
 	}
 
 	// The merged moov must contain both traks: audio id=1, video id=2.
-	moov := findBox(merged, 0, len(merged), "moov")
-	var traks []boxInfo
-	for _, b := range walkBoxes(merged, moov.off+8, moov.off+moov.size) {
-		if b.typ == "trak" {
+	moov := FindBox(merged, 0, len(merged), "moov")
+	var traks []BoxInfo
+	for _, b := range WalkBoxes(merged, moov.Off+8, moov.Off+moov.Size) {
+		if b.Typ == "trak" {
 			traks = append(traks, b)
 		}
 	}
@@ -334,29 +334,29 @@ func TestMergeInits(t *testing.T) {
 		t.Fatalf("merged moov has %d traks, want 2", len(traks))
 	}
 	for i, want := range []uint32{1, 2} {
-		tkhd := findBox(merged, traks[i].off+8, traks[i].off+traks[i].size, "tkhd")
-		got := binary.BigEndian.Uint32(merged[tkhd.off+8+12 : tkhd.off+8+16])
+		tkhd := FindBox(merged, traks[i].Off+8, traks[i].Off+traks[i].Size, "tkhd")
+		got := binary.BigEndian.Uint32(merged[tkhd.Off+8+12 : tkhd.Off+8+16])
 		if got != want {
 			t.Errorf("trak[%d] track_ID = %d, want %d", i, got, want)
 		}
 	}
 	// mvhd next_track_ID must be 3.
-	mvhd := findBox(merged, moov.off+8, moov.off+moov.size, "mvhd")
-	if got := binary.BigEndian.Uint32(merged[mvhd.off+8+96 : mvhd.off+8+100]); got != 3 {
+	mvhd := FindBox(merged, moov.Off+8, moov.Off+moov.Size, "mvhd")
+	if got := binary.BigEndian.Uint32(merged[mvhd.Off+8+96 : mvhd.Off+8+100]); got != 3 {
 		t.Errorf("next_track_ID = %d, want 3", got)
 	}
 
 	// The merged mvex must carry a trex for both tracks: audio 1 and the
 	// renumbered video 2. Without the video trex, strict demuxers (ffmpeg,
 	// PotPlayer) reject the fragments ("could not find corresponding trex").
-	mvex := findBox(merged, moov.off+8, moov.off+moov.size, "mvex")
+	mvex := FindBox(merged, moov.Off+8, moov.Off+moov.Size, "mvex")
 	if mvex == nil {
 		t.Fatal("merged moov has no mvex")
 	}
 	var trexIDs []uint32
-	for _, b := range walkBoxes(merged, mvex.off+8, mvex.off+mvex.size) {
-		if b.typ == "trex" {
-			trexIDs = append(trexIDs, binary.BigEndian.Uint32(merged[b.off+8+4:b.off+8+8]))
+	for _, b := range WalkBoxes(merged, mvex.Off+8, mvex.Off+mvex.Size) {
+		if b.Typ == "trex" {
+			trexIDs = append(trexIDs, binary.BigEndian.Uint32(merged[b.Off+8+4:b.Off+8+8]))
 		}
 	}
 	if len(trexIDs) != 2 || trexIDs[0] != 1 || trexIDs[1] != 2 {
@@ -365,16 +365,16 @@ func TestMergeInits(t *testing.T) {
 }
 
 func TestMergeInits_MissingBoxes(t *testing.T) {
-	if _, err := mergeInits(mkFtyp(), mkInitPart(1, false)); err == nil {
-		t.Error("mergeInits should fail when audio init has no moov")
+	if _, err := MergeInits(mkFtyp(), mkInitPart(1, false)); err == nil {
+		t.Error("MergeInits should fail when audio init has no moov")
 	}
-	if _, err := mergeInits(mkInitPart(1, false), mkFtyp()); err == nil {
-		t.Error("mergeInits should fail when video init has no moov")
+	if _, err := MergeInits(mkInitPart(1, false), mkFtyp()); err == nil {
+		t.Error("MergeInits should fail when video init has no moov")
 	}
 	// audio moov without a trak
 	bare := append([]byte{}, mkFtyp()...)
 	bare = append(bare, mkMoov(2)...)
-	if _, err := mergeInits(bare, mkInitPart(1, false)); err == nil {
-		t.Error("mergeInits should fail when audio moov has no trak")
+	if _, err := MergeInits(bare, mkInitPart(1, false)); err == nil {
+		t.Error("MergeInits should fail when audio moov has no trak")
 	}
 }

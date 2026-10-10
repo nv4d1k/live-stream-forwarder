@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/bmff"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 	"github.com/sirupsen/logrus"
@@ -133,24 +134,24 @@ func TestDASHStream_Produce(t *testing.T) {
 	}
 
 	// Walk the produced stream and verify structure.
-	boxes := walkBoxes(data, 0, len(data))
+	boxes := bmff.WalkBoxes(data, 0, len(data))
 	if len(boxes) < 8 {
 		t.Fatalf("too few boxes produced (%d): % x", len(boxes), data)
 	}
 
 	// First three boxes: ftyp, moov, emsg (merged init).
-	if boxes[0].typ != "ftyp" {
-		t.Errorf("box[0] = %s, want ftyp", boxes[0].typ)
+	if boxes[0].Typ != "ftyp" {
+		t.Errorf("box[0] = %s, want ftyp", boxes[0].Typ)
 	}
-	if boxes[1].typ != "moov" {
-		t.Errorf("box[1] = %s, want moov", boxes[1].typ)
+	if boxes[1].Typ != "moov" {
+		t.Errorf("box[1] = %s, want moov", boxes[1].Typ)
 	}
 	ftypCount, moovCount := 0, 0
 	for _, b := range boxes {
-		if b.typ == "ftyp" {
+		if b.Typ == "ftyp" {
 			ftypCount++
 		}
-		if b.typ == "moov" {
+		if b.Typ == "moov" {
 			moovCount++
 		}
 	}
@@ -164,15 +165,15 @@ func TestDASHStream_Produce(t *testing.T) {
 	// Merged moov holds two traks with ids 1 and 2.
 	moov := boxes[1]
 	var trakIDs []uint32
-	for _, b := range walkBoxes(data, moov.off+8, moov.off+moov.size) {
-		if b.typ != "trak" {
+	for _, b := range bmff.WalkBoxes(data, moov.Off+8, moov.Off+moov.Size) {
+		if b.Typ != "trak" {
 			continue
 		}
-		tkhd := findBox(data, b.off+8, b.off+b.size, "tkhd")
+		tkhd := bmff.FindBox(data, b.Off+8, b.Off+b.Size, "tkhd")
 		if tkhd == nil {
 			t.Fatalf("trak without tkhd")
 		}
-		trakIDs = append(trakIDs, binary.BigEndian.Uint32(data[tkhd.off+8+12:tkhd.off+8+16]))
+		trakIDs = append(trakIDs, binary.BigEndian.Uint32(data[tkhd.Off+8+12:tkhd.Off+8+16]))
 	}
 	if len(trakIDs) != 2 || trakIDs[0] != 1 || trakIDs[1] != 2 {
 		t.Errorf("merged moov trak ids = %v, want [1 2]", trakIDs)
@@ -187,26 +188,26 @@ func TestDASHStream_Produce(t *testing.T) {
 	}
 	var moofs []moofInfo
 	for _, b := range boxes {
-		if b.typ != "moof" {
+		if b.Typ != "moof" {
 			continue
 		}
-		tfhd := findBox(data, b.off+8, b.off+b.size, "tfhd")
+		tfhd := bmff.FindBox(data, b.Off+8, b.Off+b.Size, "tfhd")
 		// tfhd lives inside traf; search one level deeper.
-		for _, traf := range walkBoxes(data, b.off+8, b.off+b.size) {
-			if traf.typ != "traf" {
+		for _, traf := range bmff.WalkBoxes(data, b.Off+8, b.Off+b.Size) {
+			if traf.Typ != "traf" {
 				continue
 			}
-			for _, tb := range walkBoxes(data, traf.off+8, traf.off+traf.size) {
-				if tb.typ == "tfhd" {
+			for _, tb := range bmff.WalkBoxes(data, traf.Off+8, traf.Off+traf.Size) {
+				if tb.Typ == "tfhd" {
 					tfhd = &tb
 				}
 			}
 		}
 		if tfhd == nil {
-			t.Fatalf("moof without tfhd at %d", b.off)
+			t.Fatalf("moof without tfhd at %d", b.Off)
 		}
-		trackID := binary.BigEndian.Uint32(data[tfhd.off+8+4 : tfhd.off+8+8])
-		tfdt, _ := moofTfdt(data, b.off, b.size)
+		trackID := binary.BigEndian.Uint32(data[tfhd.Off+8+4 : tfhd.Off+8+8])
+		tfdt, _ := bmff.MoofTfdt(data, b.Off, b.Size)
 		moofs = append(moofs, moofInfo{trackID, tfdt})
 	}
 
@@ -301,13 +302,13 @@ func TestDASHStream_ReextractOn403(t *testing.T) {
 	// After recovery every piped init is a complete merged init (ftyp and
 	// moov always paired) and no tfdt is ever piped twice across the
 	// re-extraction (the tfdt cursor survives the reset).
-	boxes := walkBoxes(data, 0, len(data))
+	boxes := bmff.WalkBoxes(data, 0, len(data))
 	ftypCount, moovCount := 0, 0
 	for _, b := range boxes {
-		if b.typ == "ftyp" {
+		if b.Typ == "ftyp" {
 			ftypCount++
 		}
-		if b.typ == "moov" {
+		if b.Typ == "moov" {
 			moovCount++
 		}
 	}
@@ -319,10 +320,10 @@ func TestDASHStream_ReextractOn403(t *testing.T) {
 	}
 	seen := map[uint64]bool{}
 	for _, b := range boxes {
-		if b.typ != "moof" {
+		if b.Typ != "moof" {
 			continue
 		}
-		tfdt, ok := moofTfdt(data, b.off, b.size)
+		tfdt, ok := bmff.MoofTfdt(data, b.Off, b.Size)
 		if !ok {
 			continue
 		}
@@ -508,10 +509,10 @@ func TestDASHStream_InitProbesRunInParallel(t *testing.T) {
 			n, err := s.Read(buf)
 			acc = append(acc, buf[:n]...)
 			sawMoof := false
-			for _, b := range walkBoxes(acc, 0, len(acc)) {
-				if b.typ == "moof" {
+			for _, b := range bmff.WalkBoxes(acc, 0, len(acc)) {
+				if b.Typ == "moof" {
 					sawMoof = true
-				} else if b.typ == "mdat" && sawMoof {
+				} else if b.Typ == "mdat" && sawMoof {
 					firstMedia <- time.Since(start)
 					return
 				}
@@ -596,29 +597,29 @@ func TestDASHStream_ProactiveRenewal(t *testing.T) {
 	// The stream must stay well-formed across renewals: exactly one init
 	// (ftyp+moov pair per re-extraction is fine, but they must be paired)
 	// and no tfdt ever piped twice per track.
-	boxes := walkBoxes(data, 0, len(data))
+	boxes := bmff.WalkBoxes(data, 0, len(data))
 	ftypCount, moovCount := 0, 0
 	seen := map[uint32]map[uint64]bool{}
 	var lastByTrack map[uint32]uint64 = map[uint32]uint64{}
 	for _, b := range boxes {
-		switch b.typ {
+		switch b.Typ {
 		case "ftyp":
 			ftypCount++
 		case "moov":
 			moovCount++
 		case "moof":
 			trackID := uint32(0)
-			for _, traf := range walkBoxes(data, b.off+8, b.off+b.size) {
-				if traf.typ != "traf" {
+			for _, traf := range bmff.WalkBoxes(data, b.Off+8, b.Off+b.Size) {
+				if traf.Typ != "traf" {
 					continue
 				}
-				for _, tb := range walkBoxes(data, traf.off+8, traf.off+traf.size) {
-					if tb.typ == "tfhd" {
-						trackID = binary.BigEndian.Uint32(data[tb.off+8+4 : tb.off+8+8])
+				for _, tb := range bmff.WalkBoxes(data, traf.Off+8, traf.Off+traf.Size) {
+					if tb.Typ == "tfhd" {
+						trackID = binary.BigEndian.Uint32(data[tb.Off+8+4 : tb.Off+8+8])
 					}
 				}
 			}
-			tfdt, ok := moofTfdt(data, b.off, b.size)
+			tfdt, ok := bmff.MoofTfdt(data, b.Off, b.Size)
 			if !ok {
 				continue
 			}

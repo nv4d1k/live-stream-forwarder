@@ -1,4 +1,4 @@
-package dash
+package fanout
 
 import (
 	"errors"
@@ -7,29 +7,48 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/bmff"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/ebml"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
-// Fan-out: one upstream DASHStream (the "core") per stream key, shared by
-// any number of client subscribers. The core is the only connection to
-// YouTube — one innertube session, one pair of segment fetches per cycle,
+// Fan-out: one upstream core stream per stream key, shared by any number of
+// client subscribers. The core is the only connection to the platform —
 // regardless of how many players are watching. A pump goroutine reads the
 // core's interleaved stream box by box, keeps a ring buffer of the merged
 // init plus the most recent moof groups, and replays that snapshot to every
 // subscriber on join, then tails it with live groups.
 //
+// The core is only an io.ReadCloser, so both the DASH and SABR forwarders
+// (and any future producer of interleaved fMP4) share this implementation.
+//
 // Subscribers that stop reading are cut once their backlog exceeds
 // Hub.KickBytes (a live stream must not buffer unboundedly for a dead
 // client); they simply reconnect and rejoin from the live edge.
 
-// errSlowSubscriber terminates the stream of a subscriber whose backlog
+// ErrSlowSubscriber terminates the stream of a subscriber whose backlog
 // grew past the hub's KickBytes.
-var errSlowSubscriber = errors.New("dash: subscriber fell too far behind the live edge")
+var ErrSlowSubscriber = errors.New("fanout: subscriber fell too far behind the live edge")
 
-// Hub routes stream keys to shared DASH streams. The tuning fields are read
+// Framing selects how the pump segments the core stream into the init
+// part and the replayable groups.
+type Framing int
+
+const (
+	// FramingBMFF: the core emits an ISO-BMFF stream — the init is every
+	// box before the first moof, each group a moof plus its boxes through
+	// mdat.
+	FramingBMFF Framing = iota
+	// FramingMatroska: the core emits a Matroska stream — the init is every
+	// element before the first Cluster (EBML header, Segment head, Info,
+	// Tracks), each group one Cluster.
+	FramingMatroska
+)
+
+// Hub routes stream keys to shared core streams. The tuning fields are read
 // once when a stream is created, so they may be adjusted on a fresh hub but
-// must not be modified while streams are live. Use NewHub or DefaultHub.
+// must not be modified while streams are live. Use NewHub.
 type Hub struct {
 	mu      sync.Mutex
 	streams map[string]*SharedStream
@@ -62,33 +81,31 @@ func NewHub() *Hub {
 	}
 }
 
-// DefaultHub is the process-wide hub used by the HTTP layer.
-var DefaultHub = NewHub()
-
 // GetOrCreate returns the shared stream for key, creating (and starting) a
 // new core producer on first use. create is only invoked when no stream
-// exists for the key.
-func (h *Hub) GetOrCreate(key string, create func() *DASHStream) *SharedStream {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.Hub.GetOrCreate")
+// exists for the key; the returned stream must produce a byte stream the
+// given framing can segment (see Framing).
+func (h *Hub) GetOrCreate(key string, create func() io.ReadCloser, framing Framing) *SharedStream {
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.Hub.GetOrCreate")
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if ss, ok := h.streams[key]; ok {
-		log.WithField("key", key).Debug("reusing shared DASH stream")
+		log.WithField("key", key).Debug("reusing shared stream")
 		return ss
 	}
-	ss := newSharedStream(h, key, create())
+	ss := newSharedStream(h, key, create(), framing)
 	h.streams[key] = ss
-	log.WithField("key", key).Info("created shared DASH stream")
+	log.WithField("key", key).Info("created shared stream")
 	return ss
 }
 
 // SubscribeExisting returns a reader for the shared stream under key, or
 // nil when no live stream exists for it. It is the HTTP layer's fast path:
 // a second player joining a room already being forwarded skips the whole
-// extraction round trip (innertube + MPD + init probes) and immediately
-// replays the buffered init and groups.
+// extraction round trip and immediately replays the buffered init and
+// groups.
 func (h *Hub) SubscribeExisting(key string) io.ReadCloser {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.Hub.SubscribeExisting")
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.Hub.SubscribeExisting")
 	h.mu.Lock()
 	ss, ok := h.streams[key]
 	h.mu.Unlock()
@@ -116,11 +133,12 @@ func (h *Hub) remove(key string, ss *SharedStream) {
 	}
 }
 
-// SharedStream fans one core DASHStream out to many subscribers.
+// SharedStream fans one core stream out to many subscribers.
 type SharedStream struct {
-	hub  *Hub
-	key  string
-	core *DASHStream
+	hub     *Hub
+	key     string
+	core    io.ReadCloser
+	framing Framing
 
 	// Tuning snapshotted from the hub at creation time.
 	idleGrace       time.Duration
@@ -141,11 +159,12 @@ type SharedStream struct {
 // newSharedStream builds a SharedStream around core and starts its pump.
 // The idle timer is armed immediately so a stream that is never subscribed
 // to is still reaped.
-func newSharedStream(hub *Hub, key string, core *DASHStream) *SharedStream {
+func newSharedStream(hub *Hub, key string, core io.ReadCloser, framing Framing) *SharedStream {
 	ss := &SharedStream{
 		hub:             hub,
 		key:             key,
 		core:            core,
+		framing:         framing,
 		idleGrace:       hub.IdleGrace,
 		kickBytes:       hub.KickBytes,
 		replayMaxGroups: hub.ReplayMaxGroups,
@@ -164,7 +183,7 @@ func newSharedStream(hub *Hub, key string, core *DASHStream) *SharedStream {
 // stream. Closing the reader detaches the client; when the last client
 // leaves, the core is torn down after idleGrace.
 func (s *SharedStream) Subscribe() io.ReadCloser {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.SharedStream.Subscribe")
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.SharedStream.Subscribe")
 	s.mu.Lock()
 	if s.idleTimer != nil {
 		s.idleTimer.Stop()
@@ -188,7 +207,7 @@ func (s *SharedStream) Subscribe() io.ReadCloser {
 // unsubscribe detaches a subscriber (client disconnect or kicked); it arms
 // the idle timer when the last subscriber left.
 func (s *SharedStream) unsubscribe(sub *subscriber) {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.SharedStream.unsubscribe")
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.SharedStream.unsubscribe")
 	s.mu.Lock()
 	delete(s.subs, sub)
 	if len(s.subs) == 0 && s.idleTimer == nil {
@@ -202,7 +221,7 @@ func (s *SharedStream) unsubscribe(sub *subscriber) {
 // idleExpired tears the stream down when the grace period lapsed with no
 // subscribers.
 func (s *SharedStream) idleExpired() {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.SharedStream.idleExpired")
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.SharedStream.idleExpired")
 	s.mu.Lock()
 	empty := len(s.subs) == 0
 	s.idleTimer = nil
@@ -216,7 +235,7 @@ func (s *SharedStream) idleExpired() {
 // publishInit stores the merged init and delivers it to every subscriber
 // that attached before the core produced it.
 func (s *SharedStream) publishInit(init []byte) {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.SharedStream.publishInit")
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.SharedStream.publishInit")
 	s.mu.Lock()
 	s.init = init
 	for sub := range s.subs {
@@ -231,7 +250,7 @@ func (s *SharedStream) publishInit(init []byte) {
 // the pump must hand over a freshly allocated buffer per group. Dead pipes
 // and backlogs beyond the kick threshold are cut.
 func (s *SharedStream) publish(group []byte) {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.SharedStream.publish")
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.SharedStream.publish")
 	s.mu.Lock()
 	s.groups = append(s.groups, group)
 	s.total += len(group)
@@ -247,7 +266,7 @@ func (s *SharedStream) publish(group []byte) {
 			continue
 		}
 		if sub.pipe.Len() > s.kickBytes {
-			sub.pipe.CloseWithError(errSlowSubscriber)
+			sub.pipe.CloseWithError(ErrSlowSubscriber)
 			dead = append(dead, sub)
 		}
 	}
@@ -269,13 +288,64 @@ func (s *SharedStream) publish(group []byte) {
 // the boxes up to the next moof) to the subscribers. It exits on any core
 // error, tearing the shared stream down.
 func (s *SharedStream) pump() {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.SharedStream.pump")
-	br := newBoxReader(s.core)
+	if s.framing == FramingMatroska {
+		s.pumpMatroska()
+		return
+	}
+	s.pumpBMFF()
+}
+
+// pumpMatroska segments a Matroska core stream: everything before the first
+// Cluster (EBML header, open Segment, Info, Tracks) becomes the init
+// replayed to late joiners; each Cluster becomes one group.
+func (s *SharedStream) pumpMatroska() {
+	var buf []byte
+	var init []byte
+	initPublished := false
+	tmp := make([]byte, 64<<10)
+	for {
+		n, err := s.core.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			for {
+				e, next, needMore, serr := ebml.ScanElem(buf, 0)
+				if serr != nil {
+					s.teardown(fmt.Errorf("core stream: %w", serr))
+					return
+				}
+				if needMore {
+					break
+				}
+				if e.ID == 0x1F43B675 { // Cluster
+					if !initPublished {
+						s.publishInit(init)
+						initPublished = true
+					}
+					group := make([]byte, next)
+					copy(group, buf[:next])
+					s.publish(group)
+				} else if !initPublished {
+					init = append(init, buf[:next]...)
+				}
+				buf = buf[next:]
+			}
+		}
+		if err != nil {
+			s.teardown(fmt.Errorf("core stream ended: %w", err))
+			return
+		}
+	}
+}
+
+// pumpBMFF segments an ISO-BMFF core stream (see FramingBMFF).
+func (s *SharedStream) pumpBMFF() {
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.SharedStream.pumpBMFF")
+	br := bmff.NewBoxReader(s.core)
 	var initBuf []byte
 	var group []byte
 	initPublished := false
 	for {
-		box, typ, err := br.next()
+		box, typ, err := br.Next()
 		if err != nil {
 			s.teardown(fmt.Errorf("core stream ended: %w", err))
 			return
@@ -316,8 +386,8 @@ func (s *SharedStream) pump() {
 			// ftyp/moov/emsg of the merged init.
 			initBuf = append(initBuf, box...)
 		default:
-			// Boxes outside any group after the init (not produced by the
-			// core today) are dropped rather than corrupting the stream.
+			// Boxes outside any group after the init (not produced by
+			// the core today) are dropped rather than corrupting the stream.
 			log.WithField("key", s.key).Warnf("unexpected %s box outside init and groups", typ)
 		}
 	}
@@ -326,7 +396,7 @@ func (s *SharedStream) pump() {
 // teardown stops the core producer, closes every subscriber with err and
 // removes the stream from its hub. Idempotent.
 func (s *SharedStream) teardown(err error) {
-	log := global.Log.WithField("func", "app.engine.forwarder.dash.SharedStream.teardown")
+	log := global.Log.WithField("func", "app.engine.forwarder.fanout.SharedStream.teardown")
 	s.teardownOnce.Do(func() {
 		log.WithField("key", s.key).Warnf("tearing down shared stream: %s", err.Error())
 		s.core.Close()

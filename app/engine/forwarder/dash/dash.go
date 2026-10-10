@@ -4,10 +4,15 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/fanout"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
+
+// DefaultHub is the process-wide fan-out hub used by the HTTP layer for DASH
+// streams: one upstream core per platform:room|proxy, shared by every client.
+var DefaultHub = fanout.NewHub()
 
 // DASHForwarder builds DASHStreams with a proxied, UA-injecting HTTP client.
 type DASHForwarder struct {
