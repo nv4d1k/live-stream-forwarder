@@ -34,6 +34,14 @@ import (
 // streamToClient writes data from an io.ReadCloser to the gin context as a
 // long-lived HTTP stream. The client sees a single continuous response
 // even if the producer reconnects on 403.
+//
+// The reader is bridged through a goroutine so the loop can select on the
+// request context: a client that walks away during an upstream stall (e.g.
+// a DASH video batch mid-download) would otherwise never be noticed — the
+// loop would sit blocked in Read, unable to see writes failing, and never
+// close the reader, leaking forwarder bookkeeping (the dash hub counts
+// open subscribers; a leaked one keeps the shared core fetching upstream
+// data with nobody watching).
 func streamToClient(c *gin.Context, r io.ReadCloser, contentType string) {
 	c.Writer.Header().Set("Content-Type", contentType)
 	c.Writer.Header().Set("Connection", "close")
@@ -44,19 +52,50 @@ func streamToClient(c *gin.Context, r io.ReadCloser, contentType string) {
 	c.Writer.WriteHeader(200)
 	c.Writer.Flush()
 
-	buf := make([]byte, 65536)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			if _, writeErr := c.Writer.Write(buf[:n]); writeErr != nil {
-				r.Close()
+	type chunk struct {
+		data []byte
+		err  error
+	}
+	ctx := c.Request.Context()
+	ch := make(chan chunk, 1)
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				b := make([]byte, n)
+				copy(b, buf[:n])
+				select {
+				case ch <- chunk{data: b}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
+				select {
+				case ch <- chunk{err: err}:
+				case <-ctx.Done():
+				}
 				return
 			}
-			c.Writer.Flush()
 		}
-		if err != nil {
-			r.Close()
+	}()
+	defer r.Close()
+
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case ck := <-ch:
+			if ck.data != nil {
+				if _, err := c.Writer.Write(ck.data); err != nil {
+					return
+				}
+				c.Writer.Flush()
+			}
+			if ck.err != nil {
+				return
+			}
 		}
 	}
 }
@@ -124,6 +163,16 @@ func flvStreamWithCache(extractFn stream.ExtractFunc, proxyURL *url.URL, userAge
 	return flv.NewFLVStream(s, flv.DefaultCache, key)
 }
 
+// dashHubKey builds the dash.Hub sharing key. YouTube binds its innertube
+// URLs to the proxy exit IP, so sessions through different proxies cannot
+// share one upstream stream.
+func dashHubKey(key string, proxyURL *url.URL) string {
+	if proxyURL != nil {
+		return key + "|" + proxyURL.String()
+	}
+	return key
+}
+
 // dispatchStream routes the stream to the appropriate forwarder based on URL
 // scheme and path extension.
 func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, proxyURL *url.URL, userAgent string, key string) {
@@ -142,9 +191,15 @@ func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, pr
 			s := h.Stream(extractFn)
 			streamToClient(c, s, "video/mp2t")
 		case isDASHManifestURL(u):
-			d := dash.NewDASHForwarder(proxyURL, userAgent)
-			s := d.Stream(extractFn)
-			streamToClient(c, s, "video/mp4")
+			// One upstream session per platform:room:proxy no matter how
+			// many clients are watching: the hub fans the single core
+			// stream out to every subscriber and replays the merged init
+			// plus recent groups to each joiner.
+			shared := dash.DefaultHub.GetOrCreate(dashHubKey(key, proxyURL), func() *dash.DASHStream {
+				d := dash.NewDASHForwarder(proxyURL, userAgent)
+				return d.Stream(extractFn)
+			})
+			streamToClient(c, shared.Subscribe(), "video/mp4")
 		case path.Ext(u.Path) == ".flv" || path.Ext(u.Path) == ".xs":
 			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, userAgent, key), "video/x-flv")
 		default:
@@ -208,15 +263,30 @@ func Forwarder(c *gin.Context) {
 
 	// 3. Resolve the desired format.
 	desiredFormat := resolveDesiredFormat(format, ext)
+	key := fmt.Sprintf("%s:%s", platform, room)
 
-	// 4. Build the unified extractFn closure. The first extraction (previous
+	// 4. DASH fast path: when the request resolves to dash and a shared
+	// stream for this platform:room:proxy is already live, subscribe to it
+	// directly. The routing extraction below would otherwise cost a full
+	// innertube round trip just to learn a URL that is already being
+	// forwarded; the hub replays the buffered init and recent groups so
+	// the joining player sees data immediately. A nonexistent stream
+	// returns nil and the request proceeds through the normal path.
+	if desiredFormat == "dash" {
+		if r := dash.DefaultHub.SubscribeExisting(dashHubKey(key, proxyURL)); r != nil {
+			streamToClient(c, r, "video/mp4")
+			return
+		}
+	}
+
+	// 5. Build the unified extractFn closure. The first extraction (previous
 	// ==nil) is cached inside buildExtractFn so that dispatch routing and the
 	// chosen forwarder reuse it instead of hitting the upstream extractor
 	// twice (DouYu/Twitch would otherwise be called once for routing and
 	// again by the forwarder's produce loop).
 	extractFn := buildExtractFn(ext, desiredFormat)
 
-	// 5. Perform initial extraction.
+	// 6. Perform initial extraction.
 	result, err := extractFn(nil)
 	if err != nil {
 		log.Errorf("initial extract error: %s\n", err.Error())
@@ -224,9 +294,8 @@ func Forwarder(c *gin.Context) {
 		return
 	}
 
-	// 6. Dispatch to the appropriate forwarder.
+	// 7. Dispatch to the appropriate forwarder.
 	u, _ := url.Parse(result.URL)
-	key := fmt.Sprintf("%s:%s", platform, room)
 	dispatchStream(c, u, extractFn, proxyURL, entry.UserAgent, key)
 }
 
