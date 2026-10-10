@@ -61,9 +61,27 @@ type playerResponse struct {
 		Reason string `json:"reason"`
 	} `json:"playabilityStatus"`
 	StreamingData struct {
-		HLSManifestURL  string `json:"hlsManifestUrl"`
-		DASHManifestURL string `json:"dashManifestUrl"`
+		HLSManifestURL        string           `json:"hlsManifestUrl"`
+		DASHManifestURL       string           `json:"dashManifestUrl"`
+		ServerAbrStreamingURL string           `json:"serverAbrStreamingUrl"`
+		AdaptiveFormats       []adaptiveFormat `json:"adaptiveFormats"`
 	} `json:"streamingData"`
+	PlayerConfig struct {
+		MediaCommonConfig struct {
+			MediaUstreamerRequestConfig struct {
+				VideoPlaybackUstreamerConfig string `json:"videoPlaybackUstreamerConfig"`
+			} `json:"mediaUstreamerRequestConfig"`
+		} `json:"mediaCommonConfig"`
+	} `json:"playerConfig"`
+}
+
+// adaptiveFormat is one entry of streamingData.adaptiveFormats: enough of
+// the itag table to resolve the SABR audio/video itags for a quality hint.
+type adaptiveFormat struct {
+	ITag     int    `json:"itag"`
+	Height   int    `json:"height"`
+	FPS      int    `json:"fps"`
+	MimeType string `json:"mimeType"`
 }
 
 // getPlayer calls the innertube player API with the ANDROID client and

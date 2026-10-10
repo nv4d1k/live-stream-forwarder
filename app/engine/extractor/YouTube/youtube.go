@@ -1,15 +1,18 @@
 package YouTube
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	libm3u8 "github.com/grafov/m3u8"
+	"github.com/sirupsen/logrus"
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/global"
@@ -70,10 +73,12 @@ func (l *Link) SetQuality(quality string) {
 
 // Extract resolves the live manifest URL via the innertube player API.
 // format selects the manifest family: "dash" returns the DASH MPD (fMP4
-// representations up to and beyond 1080p), anything else returns the HLS
-// master playlist (muxed TS variants up to 1080p). The returned ExpireAt
-// comes from the manifest URL's /expire/<unix>/ path segment (about 6 hours
-// out), letting the forwarders re-extract before the URL goes stale.
+// representations up to 1080p60), "sabr" returns the server ABR endpoint
+// (fMP4 selected by itag — the only anonymous channel that serves the
+// >1080p60 formats), anything else returns the HLS master playlist (muxed
+// TS variants up to 1080p). The returned ExpireAt comes from the manifest
+// URL's /expire/<unix>/ path segment (about 6 hours out), letting the
+// forwarders re-extract before the URL goes stale.
 func (l *Link) Extract(format string) (*extractor.Result, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.YouTube.Extract")
 
@@ -90,6 +95,10 @@ func (l *Link) Extract(format string) (*extractor.Result, error) {
 	if !pr.VideoDetails.IsLive {
 		log.Warnf("room %s is not live", l.rid)
 		return nil, fmt.Errorf("room %s is not live", l.rid)
+	}
+
+	if format == "sabr" {
+		return l.extractSABR(pr, log)
 	}
 
 	var manifestURL string
@@ -127,11 +136,115 @@ func (l *Link) Extract(format string) (*extractor.Result, error) {
 }
 
 func (l *Link) SupportedFormats() []string {
-	return []string{"m3u8", "dash"}
+	return []string{"m3u8", "dash", "sabr"}
 }
 
+// DefaultFormat returns "sabr": the server ABR channel carries every
+// resolution the room offers (1440p60/2160p60 included) with a stable
+// two-track MKV output, so it is the best default for the players this
+// forwarder serves. "dash" (1080p60 fMP4) and "m3u8" remain available via
+// the format query parameter.
 func (l *Link) DefaultFormat() string {
-	return "dash"
+	return "sabr"
+}
+
+// extractSABR builds the extractor.Result for the server ABR (UMP) channel:
+// the serverAbrStreamingUrl plus the VideoPlaybackUstreamerConfig blob and
+// the itags resolved for the quality hint. A SABR session serves exactly
+// one request, so the forwarder re-extracts for every round; the URL
+// itself needs no expiry bookkeeping.
+func (l *Link) extractSABR(pr *playerResponse, log *logrus.Entry) (*extractor.Result, error) {
+	if pr.StreamingData.ServerAbrStreamingURL == "" {
+		log.Warnf("room %s has no SABR streaming URL", l.rid)
+		return nil, fmt.Errorf("room %s has no SABR streaming URL", l.rid)
+	}
+	cfgB64 := pr.PlayerConfig.MediaCommonConfig.MediaUstreamerRequestConfig.VideoPlaybackUstreamerConfig
+	if cfgB64 == "" {
+		log.Warnf("room %s player response lacks videoPlaybackUstreamerConfig", l.rid)
+		return nil, fmt.Errorf("room %s player response lacks videoPlaybackUstreamerConfig", l.rid)
+	}
+	cfg, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(strings.TrimRight(cfgB64, "="))
+	if err != nil {
+		log.Errorf("room %s: decode ustreamer config: %v", l.rid, err)
+		return nil, fmt.Errorf("decode videoPlaybackUstreamerConfig: %w", err)
+	}
+	videoITag, audioITag, err := pickSabrITags(pr, l.quality)
+	if err != nil {
+		log.Warnf("room %s: %v", l.rid, err)
+		return nil, err
+	}
+	log.Debugf("sabr result for room %s: video itag=%d audio itag=%d cfg=%d bytes",
+		l.rid, videoITag, audioITag, len(cfg))
+	return &extractor.Result{
+		URL: pr.StreamingData.ServerAbrStreamingURL,
+		Sabr: &extractor.SabrInfo{
+			UstreamerConfig: cfg,
+			VideoITag:       videoITag,
+			AudioITag:       audioITag,
+		},
+	}, nil
+}
+
+// pickSabrITags resolves the video and audio itags for a SABR request from
+// the player response's adaptive formats. The video itag is the tallest
+// format not exceeding the quality hint's height (the shortest one when
+// every format is taller; the tallest overall when no hint is set), with
+// ties preferring the higher frame rate. The audio itag prefers 140
+// (AAC 44.1kHz stereo) and falls back to any audio format.
+func pickSabrITags(pr *playerResponse, quality string) (videoITag, audioITag int, err error) {
+	target := parseQualityHeight(quality)
+
+	var videos []adaptiveFormat
+	for _, f := range pr.StreamingData.AdaptiveFormats {
+		if f.ITag != 0 && f.Height > 0 && strings.HasPrefix(f.MimeType, "video/") {
+			videos = append(videos, f)
+		}
+	}
+	if len(videos) == 0 {
+		return 0, 0, fmt.Errorf("no video formats in player response")
+	}
+	slices.SortFunc(videos, func(a, b adaptiveFormat) int {
+		if a.Height != b.Height {
+			return b.Height - a.Height // tallest first
+		}
+		return b.FPS - a.FPS // then highest frame rate
+	})
+
+	var video *adaptiveFormat
+	if target > 0 {
+		for i := range videos {
+			if videos[i].Height <= target {
+				video = &videos[i]
+				break
+			}
+		}
+		if video == nil {
+			// Every format exceeds the target: take the shortest available.
+			video = &videos[len(videos)-1]
+		}
+	} else {
+		video = &videos[0]
+	}
+
+	audioITag = 0
+	for _, f := range pr.StreamingData.AdaptiveFormats {
+		if f.ITag == 140 {
+			audioITag = 140
+			break
+		}
+	}
+	if audioITag == 0 {
+		for _, f := range pr.StreamingData.AdaptiveFormats {
+			if f.ITag != 0 && strings.HasPrefix(f.MimeType, "audio/") {
+				audioITag = f.ITag
+				break
+			}
+		}
+	}
+	if audioITag == 0 {
+		return 0, 0, fmt.Errorf("no audio formats in player response")
+	}
+	return video.ITag, audioITag, nil
 }
 
 // expireAtFromManifestURL extracts the expiry timestamp from a googlevideo

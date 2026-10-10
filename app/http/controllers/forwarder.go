@@ -23,9 +23,11 @@ import (
 
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/dash"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/fanout"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/hls"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/sabr"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/websocket"
 	"github.com/nv4d1k/live-stream-forwarder/global"
@@ -107,6 +109,12 @@ func isDASHManifestURL(u *url.URL) bool {
 	return path.Ext(u.Path) == ".mpd" || strings.Contains(u.Path, "/api/manifest/dash/")
 }
 
+// isSABRURL reports whether the URL points at YouTube's server ABR endpoint
+// (its query carries sabr=1).
+func isSABRURL(u *url.URL) bool {
+	return u.Query().Get("sabr") != ""
+}
+
 // formatFromURL determines the stream format from a URL: "ws", "flv",
 // "m3u8", etc. DouYu's p2p=2 ".xs" URLs serve the same http-flv payload as
 // ".flv", so they normalize to "flv" — dispatchStream already routes both to
@@ -116,6 +124,9 @@ func formatFromURL(u *url.URL) string {
 	switch u.Scheme {
 	case "ws", "wss":
 		return "ws"
+	}
+	if isSABRURL(u) {
+		return "sabr"
 	}
 	if isDASHManifestURL(u) {
 		return "dash"
@@ -173,9 +184,20 @@ func dashHubKey(key string, proxyURL *url.URL) string {
 	return key
 }
 
+// sabrHubKey extends the dash hub key with the quality: streams of
+// different qualities share nothing upstream, and clients of the same room
+// and quality must never open a second upstream.
+func sabrHubKey(key string, proxyURL *url.URL, quality string) string {
+	k := dashHubKey(key, proxyURL)
+	if quality != "" {
+		k += "|" + quality
+	}
+	return k
+}
+
 // dispatchStream routes the stream to the appropriate forwarder based on URL
 // scheme and path extension.
-func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, proxyURL *url.URL, userAgent string, key string) {
+func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, proxyURL *url.URL, userAgent string, key string, quality string) {
 	switch u.Scheme {
 	case "ws", "wss":
 		f := websocket.NewWebSocketForwarderWithRetry(proxyURL, userAgent, extractFn, key)
@@ -190,15 +212,25 @@ func dispatchStream(c *gin.Context, u *url.URL, extractFn stream.ExtractFunc, pr
 			h := hls.NewHLSForwarder(proxyURL, userAgent)
 			s := h.Stream(extractFn)
 			streamToClient(c, s, "video/mp2t")
+		case isSABRURL(u):
+			// One upstream session per platform:room:proxy:quality no
+			// matter how many clients are watching: the hub fans the single
+			// core stream out to every subscriber and replays the merged
+			// init plus recent groups to each joiner.
+			shared := sabr.DefaultHub.GetOrCreate(sabrHubKey(key, proxyURL, quality), func() io.ReadCloser {
+				f := sabr.NewSABRForwarder(proxyURL, userAgent)
+				return f.Stream(extractFn)
+			}, fanout.FramingMatroska)
+			streamToClient(c, shared.Subscribe(), "video/x-matroska")
 		case isDASHManifestURL(u):
 			// One upstream session per platform:room:proxy no matter how
 			// many clients are watching: the hub fans the single core
 			// stream out to every subscriber and replays the merged init
 			// plus recent groups to each joiner.
-			shared := dash.DefaultHub.GetOrCreate(dashHubKey(key, proxyURL), func() *dash.DASHStream {
+			shared := dash.DefaultHub.GetOrCreate(dashHubKey(key, proxyURL), func() io.ReadCloser {
 				d := dash.NewDASHForwarder(proxyURL, userAgent)
 				return d.Stream(extractFn)
-			})
+			}, fanout.FramingBMFF)
 			streamToClient(c, shared.Subscribe(), "video/mp4")
 		case path.Ext(u.Path) == ".flv" || path.Ext(u.Path) == ".xs":
 			streamToClient(c, flvStreamWithCache(extractFn, proxyURL, userAgent, key), "video/x-flv")
@@ -264,6 +296,7 @@ func Forwarder(c *gin.Context) {
 	// 3. Resolve the desired format.
 	desiredFormat := resolveDesiredFormat(format, ext)
 	key := fmt.Sprintf("%s:%s", platform, room)
+	quality := c.Query("quality")
 
 	// 4. DASH fast path: when the request resolves to dash and a shared
 	// stream for this platform:room:proxy is already live, subscribe to it
@@ -275,6 +308,15 @@ func Forwarder(c *gin.Context) {
 	if desiredFormat == "dash" {
 		if r := dash.DefaultHub.SubscribeExisting(dashHubKey(key, proxyURL)); r != nil {
 			streamToClient(c, r, "video/mp4")
+			return
+		}
+	}
+
+	// 4b. SABR fast path: same reasoning as the DASH one, keyed by quality
+	// so different qualities never share (or duplicate) an upstream.
+	if desiredFormat == "sabr" {
+		if r := sabr.DefaultHub.SubscribeExisting(sabrHubKey(key, proxyURL, quality)); r != nil {
+			streamToClient(c, r, "video/x-matroska")
 			return
 		}
 	}
@@ -296,7 +338,7 @@ func Forwarder(c *gin.Context) {
 
 	// 7. Dispatch to the appropriate forwarder.
 	u, _ := url.Parse(result.URL)
-	dispatchStream(c, u, extractFn, proxyURL, entry.UserAgent, key)
+	dispatchStream(c, u, extractFn, proxyURL, entry.UserAgent, key, quality)
 }
 
 // formatDeadlockThreshold is how many consecutive format mismatches are
@@ -356,6 +398,7 @@ func buildExtractFn(ext extractor.Extractor, desiredFormat string) stream.Extrac
 			Headers:         result.Headers,
 			ExpireAt:        result.ExpireAt,
 			VariantSelector: result.VariantSelector,
+			Sabr:            result.Sabr,
 		}
 		u, parseErr := url.Parse(result.URL)
 		if parseErr != nil {

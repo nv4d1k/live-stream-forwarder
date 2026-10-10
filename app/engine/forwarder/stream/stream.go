@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/extractor"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
 
@@ -37,6 +38,10 @@ type ExtractResult struct {
 	Headers         http.Header
 	ExpireAt        *time.Time // when the URL expires; nil means unknown or no expiry
 	VariantSelector any        // optional func([]*libm3u8.Variant) *libm3u8.Variant; used by HLS forwarder
+	// Sabr carries the VideoPlaybackUstreamerConfig blob and selected itags
+	// when the URL points at a YouTube SABR (server ABR) endpoint; nil for
+	// every other stream kind.
+	Sabr *extractor.SabrInfo
 }
 
 // FetchFunc returns the upstream response body for a given URL.

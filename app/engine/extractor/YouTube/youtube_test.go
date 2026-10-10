@@ -1,6 +1,8 @@
 package YouTube
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,7 +58,7 @@ func newPlayerServer(t *testing.T, status int, body string) (*httptest.Server, *
 func TestYouTube_SupportedFormats(t *testing.T) {
 	l := &Link{}
 	formats := l.SupportedFormats()
-	expected := []string{"m3u8", "dash"}
+	expected := []string{"m3u8", "dash", "sabr"}
 	if len(formats) != len(expected) {
 		t.Fatalf("expected %d formats, got %d", len(expected), len(formats))
 	}
@@ -69,8 +71,8 @@ func TestYouTube_SupportedFormats(t *testing.T) {
 
 func TestYouTube_DefaultFormat(t *testing.T) {
 	l := &Link{}
-	if got := l.DefaultFormat(); got != "dash" {
-		t.Errorf("DefaultFormat() = %q, want %q", got, "dash")
+	if got := l.DefaultFormat(); got != "sabr" {
+		t.Errorf("DefaultFormat() = %q, want %q", got, "sabr")
 	}
 }
 
@@ -429,5 +431,119 @@ func TestYouTube_Extract_DashNoManifest(t *testing.T) {
 	// The HLS path still works for the same response.
 	if _, err := l.Extract("m3u8"); err != nil {
 		t.Errorf("Extract(m3u8) should still succeed: %v", err)
+	}
+}
+
+// sabrPlayerJSON builds a player response carrying the SABR fields: the
+// serverAbrStreamingUrl, the ustreamer config and an adaptive format table
+// mirroring the shape of a live room above 1080p.
+func sabrPlayerJSON() string {
+	cfg := base64.RawURLEncoding.EncodeToString([]byte{0xDE, 0xAD, 0xBE, 0xEF})
+	return fmt.Sprintf(`{
+		"videoDetails":{"videoId":"soSXsuGVkqc","title":"Fireplace","isLive":true},
+		"playabilityStatus":{"status":"OK"},
+		"streamingData":{
+			"serverAbrStreamingUrl":"https://rr1.example.com/videoplayback?expire=1791636338&sabr=1",
+			"adaptiveFormats":[
+				{"itag":315,"height":2160,"fps":60,"mimeType":"video/webm; codecs=\"vp9\""},
+				{"itag":308,"height":1440,"fps":60,"mimeType":"video/webm; codecs=\"vp9\""},
+				{"itag":299,"height":1080,"fps":60,"mimeType":"video/mp4; codecs=\"avc1\""},
+				{"itag":135,"height":480,"fps":30,"mimeType":"video/mp4; codecs=\"avc1\""},
+				{"itag":140,"mimeType":"audio/mp4; codecs=\"mp4a.40.2\""}
+			]
+		},
+		"playerConfig":{"mediaCommonConfig":{"mediaUstreamerRequestConfig":{"videoPlaybackUstreamerConfig":%q}}}
+	}`, cfg)
+}
+
+func TestYouTube_Extract_SABR(t *testing.T) {
+	ts, _ := newPlayerServer(t, http.StatusOK, sabrPlayerJSON())
+	l := &Link{rid: "soSXsuGVkqc", client: ts.Client(), apiBase: ts.URL}
+	result, err := l.Extract("sabr")
+	if err != nil {
+		t.Fatalf("Extract(sabr) error: %v", err)
+	}
+	if !strings.Contains(result.URL, "sabr=1") {
+		t.Errorf("URL = %q, want the serverAbrStreamingUrl", result.URL)
+	}
+	if result.Sabr == nil {
+		t.Fatal("Sabr info missing")
+	}
+	if !bytes.Equal(result.Sabr.UstreamerConfig, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
+		t.Errorf("ustreamer config = %x", result.Sabr.UstreamerConfig)
+	}
+	// No quality hint: the tallest format wins.
+	if result.Sabr.VideoITag != 315 {
+		t.Errorf("video itag = %d, want 315 (tallest)", result.Sabr.VideoITag)
+	}
+	if result.Sabr.AudioITag != 140 {
+		t.Errorf("audio itag = %d, want 140", result.Sabr.AudioITag)
+	}
+}
+
+func TestYouTube_Extract_SABR_QualityHint(t *testing.T) {
+	ts, _ := newPlayerServer(t, http.StatusOK, sabrPlayerJSON())
+	l := &Link{rid: "soSXsuGVkqc", client: ts.Client(), apiBase: ts.URL}
+	l.SetQuality("1440p")
+	result, err := l.Extract("sabr")
+	if err != nil {
+		t.Fatalf("Extract(sabr) error: %v", err)
+	}
+	if result.Sabr.VideoITag != 308 {
+		t.Errorf("video itag = %d, want 308 (tallest not over 1440)", result.Sabr.VideoITag)
+	}
+	// A hint below every format: the shortest one.
+	l2 := &Link{rid: "soSXsuGVkqc", client: ts.Client(), apiBase: ts.URL}
+	l2.SetQuality("240p")
+	result2, err := l2.Extract("sabr")
+	if err != nil {
+		t.Fatalf("Extract(sabr) error: %v", err)
+	}
+	if result2.Sabr.VideoITag != 135 {
+		t.Errorf("video itag = %d, want 135 (shortest when all exceed)", result2.Sabr.VideoITag)
+	}
+}
+
+func TestYouTube_Extract_SABR_MissingEndpoint(t *testing.T) {
+	ts, _ := newPlayerServer(t, http.StatusOK, playerJSON("OK", "", true, testHLSURL))
+	l := &Link{rid: "WWTcu33u00A", client: ts.Client(), apiBase: ts.URL}
+	if _, err := l.Extract("sabr"); err == nil {
+		t.Error("Extract(sabr) must fail without a serverAbrStreamingUrl")
+	}
+}
+
+func TestPickSabrITags(t *testing.T) {
+	mk := func(formats ...adaptiveFormat) *playerResponse {
+		pr := &playerResponse{}
+		pr.StreamingData.AdaptiveFormats = formats
+		return pr
+	}
+	formats := []adaptiveFormat{
+		{ITag: 315, Height: 2160, FPS: 60, MimeType: "video/webm"},
+		{ITag: 308, Height: 1440, FPS: 60, MimeType: "video/webm"},
+		{ITag: 303, Height: 1080, FPS: 60, MimeType: "video/webm"},
+		{ITag: 299, Height: 1080, FPS: 60, MimeType: "video/mp4"},
+		{ITag: 140, MimeType: "audio/mp4"},
+	}
+	video, audio, err := pickSabrITags(mk(formats...), "1440p")
+	if err != nil || video != 308 || audio != 140 {
+		t.Errorf("1440p: video=%d audio=%d err=%v, want 308/140/nil", video, audio, err)
+	}
+	video, _, err = pickSabrITags(mk(formats...), "")
+	if err != nil || video != 315 {
+		t.Errorf("no hint: video=%d err=%v, want 315", video, err)
+	}
+	// Same height, higher fps wins.
+	fpsFormats := []adaptiveFormat{
+		{ITag: 134, Height: 360, FPS: 30, MimeType: "video/mp4"},
+		{ITag: 243, Height: 360, FPS: 30, MimeType: "video/webm"},
+		{ITag: 999, MimeType: "audio/mp4"},
+	}
+	video, audio, err = pickSabrITags(mk(fpsFormats...), "360p")
+	if err != nil || audio != 999 {
+		t.Errorf("audio fallback: audio=%d err=%v, want 999", audio, err)
+	}
+	if _, _, err := pickSabrITags(mk(), ""); err == nil {
+		t.Error("empty formats must error")
 	}
 }

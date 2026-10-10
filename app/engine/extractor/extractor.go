@@ -12,6 +12,23 @@ type Result struct {
 	Headers         http.Header
 	ExpireAt        *time.Time // when the URL expires; nil means unknown or no expiry
 	VariantSelector any        // optional func([]*libm3u8.Variant) *libm3u8.Variant; used by HLS forwarder
+	// Sabr carries the extra payloads a SABR forwarder needs when the URL
+	// points at YouTube's serverAbrStreamingUrl endpoint: the player
+	// response's VideoPlaybackUstreamerConfig blob and the audio/video itags
+	// resolved for the requested quality. Nil for non-SABR results.
+	Sabr *SabrInfo
+}
+
+// SabrInfo is the extractor-side companion of a SABR (server ABR) stream
+// URL. The forwarder POSTs UMP-framed VideoPlaybackAbrRequests to the URL,
+// embedding the UstreamerConfig and selecting these itags.
+type SabrInfo struct {
+	// UstreamerConfig is the base64-decoded videoPlaybackUstreamerConfig
+	// from the player response's playerConfig.
+	UstreamerConfig []byte
+	// VideoITag / AudioITag are the itags to request (e.g. 315 + 140).
+	VideoITag int
+	AudioITag int
 }
 
 // Extractor is the unified interface that every platform extractor must implement.
