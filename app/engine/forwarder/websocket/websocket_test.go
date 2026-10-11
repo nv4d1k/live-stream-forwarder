@@ -540,27 +540,38 @@ func TestIsTimeout(t *testing.T) {
 // passed. A real upstream sends the header exactly once per connection and
 // continues with media-only messages.
 func flvMediaTag() []byte {
-	return []byte{
-		0x08, 0x00, 0x00, 0x01, // tag type 8 (audio), data size 1
-		0x00, 0x00, 0x00, 0x00, // timestamp
-		0x00, 0x00, 0x00, // stream id
-		0x00,                   // tag data
-		0x00, 0x00, 0x00, 0x0f, // previous tag size
-	}
+	return flvTagWith(0x00)
 }
 
 // flvMediaChunk is a self-contained FLV header plus one media (non-config)
 // audio tag. HeaderCacheWriter caches and strips the header and flushes the
 // media tag through to the pipe, so the client records a pipe write.
 func flvMediaChunk() []byte {
-	// FLV signature (3) + version (1) + flags (1) + header size (4) = 9 bytes.
-	header := []byte("FLV\x01\x00\x00\x00\x00\x09")
-	prevTagSize0 := []byte{0, 0, 0, 0}
-	// Audio tag: type 0x08, dataSize 1, payload 0x00 (raw PCM — not a config tag).
-	tagHeader := []byte{0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	tagData := []byte{0x00}
-	prevTagSize := []byte{0, 0, 0, 0x0f}
-	return append(append(append(append(header, prevTagSize0...), tagHeader...), tagData...), prevTagSize...)
+	return flvChunkWith(0x00)
+}
+
+// flvTagWith is flvMediaTag with a configurable payload byte so tests can
+// tell upstreams apart by the media data they serve.
+func flvTagWith(payload byte) []byte {
+	return []byte{
+		0x08, 0x00, 0x00, 0x01, // tag type 8 (audio), data size 1
+		0x00, 0x00, 0x00, 0x00, // timestamp
+		0x00, 0x00, 0x00, // stream id
+		payload,                // tag data
+		0x00, 0x00, 0x00, 0x0f, // previous tag size
+	}
+}
+
+// flvChunkWith is a self-contained FLV header plus one media tag carrying
+// the given payload byte. Like a fresh upstream connection, it starts with
+// a complete FLV stream — header included.
+func flvChunkWith(payload byte) []byte {
+	// FLV signature (3) + version (1) + flags (1) + header size (4) = 9 bytes,
+	// then the 4-byte previous-tag-size-0 field.
+	return append(
+		append([]byte("FLV\x01\x00\x00\x00\x00\x09"), []byte{0, 0, 0, 0}...),
+		flvTagWith(payload)...,
+	)
 }
 
 // flvDribbleChunk starts an FLV header plus a video tag header that declares
@@ -766,5 +777,288 @@ func TestReconnectStopsOnFormatDeadlock(t *testing.T) {
 	}
 	if !errors.Is(err, stream.ErrFormatDeadlock) {
 		t.Errorf("expected pipe error wrapping ErrFormatDeadlock, got: %v", err)
+	}
+}
+
+// wsStallServer serves one FLV chunk then goes silent on every connection,
+// keeping the connection open without data (watchdog bait) so the client is
+// pushed into a reconnect.
+func wsStallServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	up := ws.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		c.WriteMessage(ws.BinaryMessage, flvMediaChunk())
+		select {}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// httpFLVOnce serves a single complete FLV chunk and closes the response,
+// standing in for a short-lived http-flv upstream.
+func httpFLVOnce(t *testing.T, payload byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/x-flv")
+		w.Write(flvChunkWith(payload))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// httpFLVForever serves an open-ended http-flv upstream: a complete FLV
+// chunk once, then media tags on a ticker. A request to /expired.flv is
+// answered with 403, simulating a rejected (expired) CDN URL.
+func httpFLVForever(t *testing.T, payload byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/expired.flv" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		flusher, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "video/x-flv")
+		w.Write(flvChunkWith(payload))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			if _, err := w.Write(flvTagWith(payload)); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestReadLoopFallsBackToHTTPAndReturns is the regression for the DouYu p2p
+// flap: the room starts on a wss upstream, the rate stream then serves it
+// without p2p (an http-flv URL) and finally returns to wss. The client must
+// ride the http upstream in between and come back to ws, with the pipe never
+// carrying a second FLV header and the client seeing no break.
+func TestReadLoopFallsBackToHTTPAndReturns(t *testing.T) {
+	up := ws.Upgrader{}
+	var wsConns atomic.Int32
+	wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		switch wsConns.Add(1) {
+		case 1:
+			// One chunk, then silence: the watchdog reconnects.
+			c.WriteMessage(ws.BinaryMessage, flvMediaChunk())
+			select {}
+		default:
+			defer c.Close()
+			c.WriteMessage(ws.BinaryMessage, flvChunkWith(0x55))
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := c.WriteMessage(ws.BinaryMessage, flvTagWith(0x55)); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer wsSrv.Close()
+	httpSrv := httpFLVOnce(t, 0x42)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		switch calls.Add(1) {
+		case 1:
+			return &stream.ExtractResult{URL: wsURL(wsSrv)}, nil
+		case 2:
+			return &stream.ExtractResult{URL: httpSrv.URL + "/live/room.flv"}, nil
+		default:
+			return &stream.ExtractResult{URL: wsURL(wsSrv)}, nil
+		}
+	}, nil, nil, "test:fallback-return").(*client)
+	cl.watchdog = 100 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// The http fallback's media (payload 0x42) must reach the pipe.
+	out1, err := readUntil(t, cl, "\x42", 3*time.Second)
+	if err != nil {
+		t.Fatalf("http fallback media never arrived: %v (got %q)", err, out1)
+	}
+	// The http body ends; the next extraction is wss again and its media
+	// (payload 0x55) must keep the stream going.
+	out2, err := readUntil(t, cl, "\x55", 3*time.Second)
+	if err != nil {
+		t.Fatalf("stream did not return to ws: %v (got %q)", err, out2)
+	}
+	// Exactly one ws → http → ws cycle; no further reconnects while data flows.
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 3 {
+		t.Errorf("extractFn called %d times, want 3", got)
+	}
+	// Neither upstream's FLV header may leak into the pipe: the client got
+	// its single header from the cache at Start.
+	if strings.Contains(out1, "FLV") || strings.Contains(out2, "FLV") {
+		t.Errorf("pipe output contains an FLV signature (out1=%q out2=%q)", out1, out2)
+	}
+}
+
+// TestReadLoopHTTPFallbackEndures verifies that a stream stuck on the http
+// fallback keeps flowing (the fallback is a stable long-term upstream, not a
+// one-shot) with no spurious reconnects while media flows.
+func TestReadLoopHTTPFallbackEndures(t *testing.T) {
+	wsSrv := wsStallServer(t)
+	httpSrv := httpFLVForever(t, 0x66)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		if calls.Add(1) == 1 {
+			return &stream.ExtractResult{URL: wsURL(wsSrv)}, nil
+		}
+		return &stream.ExtractResult{URL: httpSrv.URL + "/live/room.flv"}, nil
+	}, nil, nil, "test:fallback-endure").(*client)
+	cl.watchdog = 100 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Read well past the initial ws chunk: sustained data must come from
+	// the http fallback's ticker.
+	out, err := readBytes(t, cl, 256, 3*time.Second)
+	if err != nil {
+		t.Fatalf("fallback stream did not flow: %v (got %d bytes)", err, len(out))
+	}
+	if !strings.Contains(string(out), "\x66") {
+		t.Error("expected http fallback media (payload 0x66) in the pipe")
+	}
+	if strings.Contains(string(out), "FLV") {
+		t.Error("pipe output contains an FLV signature; the fallback's header must be stripped")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 2 {
+		t.Errorf("extractFn called %d times, want 2 (fallback must be sticky)", got)
+	}
+}
+
+// TestHTTPFallbackRetriesGetErrors verifies that a rejected fallback GET
+// (an expired CDN URL answering 403) is retried with backoff like a failed
+// ws dial instead of killing the stream.
+func TestHTTPFallbackRetriesGetErrors(t *testing.T) {
+	wsSrv := wsStallServer(t)
+	httpSrv := httpFLVForever(t, 0x77)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		switch calls.Add(1) {
+		case 1:
+			return &stream.ExtractResult{URL: wsURL(wsSrv)}, nil
+		case 2:
+			// Expired/forbidden fallback URL: must be counted as a failed
+			// attempt and retried, not fatal.
+			return &stream.ExtractResult{URL: httpSrv.URL + "/expired.flv"}, nil
+		default:
+			return &stream.ExtractResult{URL: httpSrv.URL + "/live/room.flv"}, nil
+		}
+	}, nil, nil, "").(*client)
+	cl.watchdog = 100 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	out, err := readUntil(t, cl, "\x77", 3*time.Second)
+	if err != nil {
+		t.Fatalf("fallback GET failure was not retried: %v (got %q)", err, out)
+	}
+	if got := calls.Load(); got < 3 {
+		t.Errorf("extractFn called %d times, want >= 3 (403 fallback must be retried)", got)
+	}
+}
+
+// TestCloseUnblocksHTTPFallback verifies that Close() while the client is
+// reading the http fallback unblocks the reader and closes the pipe, so no
+// goroutine is left hanging on the upstream body.
+func TestCloseUnblocksHTTPFallback(t *testing.T) {
+	wsSrv := wsStallServer(t)
+	httpSrv := httpFLVForever(t, 0x88)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		if calls.Add(1) == 1 {
+			return &stream.ExtractResult{URL: wsURL(wsSrv)}, nil
+		}
+		return &stream.ExtractResult{URL: httpSrv.URL + "/live/room.flv"}, nil
+	}, nil, nil, "").(*client)
+	cl.watchdog = 100 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Wait until the fallback is actively carrying the stream.
+	if out, err := readUntil(t, cl, "\x88", 3*time.Second); err != nil {
+		t.Fatalf("http fallback never became active: %v (got %q)", err, out)
+	}
+	if err := cl.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, err := cl.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected pipe error after Close during fallback")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read still blocked after Close: fallback body was not closed")
+	}
+}
+
+// TestIsHTTPFLVURL verifies the classification of fallback-capable upstreams:
+// only http(s) .flv/.xs URLs carry the FLV payload a ws stream can ride.
+func TestIsHTTPFLVURL(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"http flv", "http://cdn.douyu.com/live/123.flv?txSecret=s", true},
+		{"https flv", "https://cdn.douyu.com/live/123.flv", true},
+		{"https xs", "https://hlsh5p2.douyucdn2.cn/live/123.xs?txSecret=s", true},
+		{"websocket", "wss://sug.douyu.com/live/123.flv", false},
+		{"m3u8", "https://host/live/index.m3u8", false},
+		{"no extension", "https://host/live/stream", false},
+		{"invalid", "://invalid", false},
+		{"empty", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isHTTPFLVURL(tt.url); got != tt.want {
+				t.Errorf("isHTTPFLVURL(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
 	}
 }

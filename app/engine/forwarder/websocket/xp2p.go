@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"runtime"
 	"strings"
 	"sync"
@@ -66,6 +67,7 @@ func NewXP2PClient(u string, header http.Header, proxy *url.URL) Background {
 	c := &client{
 		url:    u,
 		header: header,
+		proxy:  proxy,
 		dialer: &ws.Dialer{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
@@ -106,11 +108,18 @@ func NewXP2PClient(u string, header http.Header, proxy *url.URL) Background {
 // NewXP2PClientWithRetry creates a client that will reconnect with a new URL
 // from extractFn when the connection fails with a retriable error (e.g. 403).
 // cacheKey enables FLV header caching; empty string disables it.
+//
+// When extractFn returns an http-flv URL instead of a ws one (DouYu's rate
+// stream decides the transport per request and flaps between p2p and http
+// CDN), the client temporarily reads that upstream — both carry the same
+// FLV payload — and returns to ws on a later re-extraction, so the client
+// sees no break.
 func NewXP2PClientWithRetry(extractFn stream.ExtractFunc, header http.Header, proxy *url.URL, cacheKey string) Background {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.NewXP2PClientWithRetry")
 	log.WithField("cacheKey", cacheKey).Debug("creating XP2PClientWithRetry")
 	c := &client{
 		header: header,
+		proxy:  proxy,
 		dialer: &ws.Dialer{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
@@ -162,6 +171,20 @@ type client struct {
 	previous     *stream.ExtractResult
 	cacheKey     string
 	headerWriter *flv.HeaderCacheWriter
+
+	// proxy mirrors the constructor argument for the http-flv fallback's
+	// lazy transport: the fallback must leave through the same proxy the ws
+	// dialer uses, or the platform sees a different client.
+	proxy *url.URL
+	// httpBody is the response body of the http-flv upstream the client
+	// temporarily reads while the platform serves the room without p2p
+	// (DouYu's rate stream flaps between wss and http URLs). Exactly one of
+	// conn / httpBody is active at a time; guarded by mu like conn.
+	httpBody io.ReadCloser
+	// httpClient fetches the http-flv fallback URLs; built lazily on the
+	// ReadLoop goroutine (the only caller of reconnect), so no lock is
+	// needed around it.
+	httpClient *http.Client
 
 	// pipeWriteNano is the UnixNano timestamp of the last write that actually
 	// reached the pipe (0 = never). It feeds the pipe-stall watchdog, which
@@ -328,12 +351,22 @@ func (c *client) Close() error {
 		return nil
 	}
 	c.closed = true
-	if c.conn == nil {
+	conn := c.conn
+	body := c.httpBody
+	c.conn = nil
+	c.httpBody = nil
+	if conn == nil && body == nil {
 		return nil
 	}
 	log.Debug("closing connection")
-	err := c.conn.Close()
-	c.conn = nil
+	var err error
+	if conn != nil {
+		err = conn.Close()
+	}
+	// Closing the fallback body unblocks a ReadLoop parked on it.
+	if body != nil {
+		body.Close()
+	}
 	return err
 }
 
@@ -348,15 +381,27 @@ func (c *client) isClosed() bool {
 func (c *client) ReadLoop() {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.ReadLoop")
 	for {
-		// Snapshot conn under the lock: Close() may zero c.conn concurrently,
-		// and reading it here without the lock was the source of both a
-		// nil-pointer panic (Close races ReadLoop) and a data race on c.conn.
+		// Snapshot the active read source under the lock: Close() may zero
+		// c.conn or c.httpBody concurrently, and reading them here without
+		// the lock was the source of both a nil-pointer panic (Close races
+		// ReadLoop) and a data race on c.conn. Exactly one source is active:
+		// the ws connection, or the http-flv body the client falls back to
+		// while the platform serves the room without p2p.
 		c.mu.Lock()
 		conn := c.conn
+		httpBody := c.httpBody
 		closed := c.closed
 		c.mu.Unlock()
-		if closed || conn == nil {
+		if closed || (conn == nil && httpBody == nil) {
 			return
+		}
+		if conn == nil {
+			// The http-flv fallback is carrying the stream: read one chunk
+			// from it and reconnect when it ends.
+			if !c.readHTTPFallback(httpBody) {
+				return
+			}
+			continue
 		}
 		// Arm the read deadline to the earlier of the no-data watchdog and
 		// the proactive refresh point (ExpireAt - refreshLead). A stalled
@@ -418,21 +463,9 @@ func (c *client) ReadLoop() {
 		}
 		switch mt {
 		case ws.BinaryMessage:
-			if c.cacheKey != "" {
-				if c.headerWriter == nil {
-					// Wrap the pipe so the client sees which writes actually
-					// reach it — the header cache writer may buffer data
-					// indefinitely while detecting, and only real pipe writes
-					// count as stream progress for the pipe-stall watchdog.
-					c.headerWriter = flv.NewHeaderCacheWriter(&markingWriter{next: c.pipe, mark: c.markPipeWrite}, flv.DefaultCache, c.cacheKey)
-				}
-				if _, writeErr := c.headerWriter.Write(body); writeErr != nil {
-					c.pipe.CloseWithError(writeErr)
-					return
-				}
-			} else {
-				c.pipe.Write(body)
-				c.markPipeWrite()
+			if err := c.writeMedia(body); err != nil {
+				c.pipe.CloseWithError(err)
+				return
 			}
 		case ws.TextMessage:
 		case ws.CloseMessage:
@@ -445,6 +478,91 @@ func (c *client) ReadLoop() {
 			return
 		}
 	}
+}
+
+// writeMedia pipes one chunk of upstream media data into the stream. Every
+// fresh upstream (a ws connection or an http-flv fallback body) restarts
+// with a complete FLV header; the header cache writer detects, caches and
+// strips it, so the pipe keeps carrying media data only and the downstream
+// client — which already got its single header from the cache — never sees a
+// second FLV signature. Shared by the ws message path and the http-fallback
+// read path.
+func (c *client) writeMedia(data []byte) error {
+	if c.cacheKey == "" {
+		if _, err := c.pipe.Write(data); err != nil {
+			return err
+		}
+		c.markPipeWrite()
+		return nil
+	}
+	if c.headerWriter == nil {
+		// Wrap the pipe so the client sees which writes actually reach it —
+		// the header cache writer may buffer data indefinitely while
+		// detecting, and only real pipe writes count as stream progress for
+		// the pipe-stall watchdog.
+		c.headerWriter = flv.NewHeaderCacheWriter(&markingWriter{next: c.pipe, mark: c.markPipeWrite}, flv.DefaultCache, c.cacheKey)
+	}
+	_, err := c.headerWriter.Write(data)
+	return err
+}
+
+// readHTTPFallback performs one read from the temporary http-flv upstream
+// that replaces the ws connection while the platform serves the room without
+// p2p. It returns true when the ReadLoop should continue (chunk piped, or a
+// reconnect succeeded), false when the stream is over.
+//
+// The read deadline is enforced with a timer that closes the body: unlike a
+// ws conn, an http response body has no SetReadDeadline, and closing it
+// unblocks the in-flight Read — so the same watchdog/refresh/pipe-stall
+// deadlines that govern the ws path drive the fallback too.
+func (c *client) readHTTPFallback(body io.ReadCloser) bool {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.readHTTPFallback")
+	// Force-close this body when the next deadline expires, unblocking the
+	// read below. The timer captures the local body, never c.httpBody, so it
+	// can never kill a source a reconnect has already swapped in.
+	timer := time.AfterFunc(time.Until(c.readDeadline()), func() {
+		body.Close()
+	})
+	buf := make([]byte, 65536)
+	n, err := body.Read(buf)
+	timer.Stop()
+	// Close() may have fired while we were blocked reading; if so the
+	// downstream client is gone and the pipe must not keep reconnecting.
+	if c.isClosed() {
+		c.pipe.CloseWithError(errClientClosed)
+		return false
+	}
+	// io.Copy semantics: a partial chunk read together with an error is
+	// still piped first, so the handover seam never drops bytes.
+	if n > 0 {
+		if writeErr := c.writeMedia(buf[:n]); writeErr != nil {
+			c.pipe.CloseWithError(writeErr)
+			return false
+		}
+	}
+	if err != nil {
+		// The body ended: the refresh timer closed it at the proactive
+		// refresh point, the watchdog declared it stalled, or the CDN cut
+		// the connection. Re-extract: if p2p is back the client returns to
+		// ws, otherwise it keeps riding the http fallback.
+		log.WithField("field", "http fallback").Debugf("http upstream ended: %s", err.Error())
+		return c.reconnect()
+	}
+	// Positive refresh check, same as the ws path: swap in a fresh URL at
+	// the proactive refresh point even while data is still flowing, so the
+	// handover happens without a client-visible break.
+	if c.refreshDue() {
+		log.Info("proactive refresh point reached on http upstream, swapping in a fresh URL")
+		return c.reconnect()
+	}
+	// Positive pipe-stall check, same as the ws path: data arrived, but if
+	// nothing consumable has reached the pipe within the watchdog window
+	// the upstream is fake alive — reconnect now.
+	if c.pipeStalled() {
+		log.Warn("pipe stall detected on http upstream, reconnecting...")
+		return c.reconnect()
+	}
+	return true
 }
 
 // readDeadline returns when the next ReadMessage must give up: the earliest
@@ -498,14 +616,21 @@ func (m *markingWriter) Write(p []byte) (int, error) {
 // closed with an error.
 func (c *client) reconnect() bool {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.reconnect")
-	// Drop the stale connection first so its socket doesn't linger.
+	// Drop the stale read source first so its socket doesn't linger.
+	// Exactly one of conn / httpBody is active; whichever it is, close it.
 	c.mu.Lock()
 	oldConn := c.conn
+	oldBody := c.httpBody
 	c.conn = nil
+	c.httpBody = nil
 	c.mu.Unlock()
 	if oldConn != nil {
 		oldConn.Close()
 	}
+	if oldBody != nil {
+		oldBody.Close()
+	}
+	wasFallback := oldBody != nil
 
 	for fails := 0; ; fails++ {
 		// Stop as soon as the downstream client is gone.
@@ -527,11 +652,7 @@ func (c *client) reconnect() bool {
 				return false
 			}
 			log.WithField("field", "attempt").Warnf("extract for reconnect error (%d): %s", fails+1, extractErr.Error())
-		} else if !isWebSocketURL(result.URL) {
-			// The platform may stop serving ws for this room; treat as a
-			// retryable failure in case the next extraction switches back.
-			log.Warnf("extract returned non-websocket URL: %s", result.URL)
-		} else {
+		} else if isWebSocketURL(result.URL) {
 			// DialContext reads c.url, so point it at the fresh URL first.
 			c.url = result.URL
 			ctx, cancel := context.WithTimeout(context.TODO(), dialTimeout)
@@ -545,10 +666,41 @@ func (c *client) reconnect() bool {
 				// deliver its first consumable data, instead of letting the
 				// previous connection's stall immediately expire the deadline.
 				c.markPipeWrite()
-				log.WithField("field", "attempt").Infoln("reconnected successfully")
+				if wasFallback {
+					log.WithField("field", "attempt").Infoln("reconnected successfully (p2p recovered, back on the websocket upstream)")
+				} else {
+					log.WithField("field", "attempt").Infoln("reconnected successfully")
+				}
 				return true
 			}
 			log.WithField("field", "attempt").Warnf("reconnect dial error (%d): %s", fails+1, dialErr.Error())
+		} else if isHTTPFLVURL(result.URL) {
+			// The platform is serving the room without p2p right now but the
+			// payload is the same FLV media data (DouYu's rate stream flaps
+			// the transport between wss and http .flv/.xs per request). Ride
+			// the http upstream until the next re-extraction; when p2p comes
+			// back the loop above returns to ws without the client noticing.
+			body, openErr := c.openHTTPUpstream(result)
+			if openErr != nil {
+				log.WithField("field", "attempt").Warnf("open http-flv fallback error (%d): %s", fails+1, openErr.Error())
+			} else {
+				c.mu.Lock()
+				c.httpBody = body
+				c.mu.Unlock()
+				c.previous = result
+				// Fresh upstream starts with a complete FLV header: reset the
+				// header writer so it is detected and stripped again.
+				c.headerWriter = nil
+				// Give the fresh source a full pipe-watchdog window before
+				// the previous source's stall expires the deadline.
+				c.markPipeWrite()
+				log.WithField("field", "attempt").Warnf("p2p unavailable, riding http-flv upstream (attempt %d)", fails+1)
+				return true
+			}
+		} else {
+			// The platform may stop serving ws for this room; treat as a
+			// retryable failure in case the next extraction switches back.
+			log.Warnf("extract returned non-websocket URL: %s", result.URL)
 		}
 
 		if fails+1 >= c.maxFails() {
@@ -590,4 +742,65 @@ func isWebSocketURL(u string) bool {
 		return false
 	}
 	return parsed.Scheme == "ws" || parsed.Scheme == "wss"
+}
+
+// isHTTPFLVURL reports whether u points at an http(s) FLV-family upstream:
+// a plain .flv CDN URL or DouYu's p2p=2 .xs URL, which serves the same FLV
+// payload over http. These are the only upstreams a ws stream can fall
+// back to without the client noticing — the payload is identical.
+func isHTTPFLVURL(u string) bool {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	ext := path.Ext(parsed.Path)
+	return ext == ".flv" || ext == ".xs"
+}
+
+// fallbackHTTPClient returns the http client used to fetch http-flv
+// fallback URLs, building it on first use. It runs on the ReadLoop
+// goroutine (the only caller of reconnect), so the lazy init needs no lock.
+func (c *client) fallbackHTTPClient() *http.Client {
+	if c.httpClient == nil {
+		transport := &http.Transport{}
+		if c.proxy != nil {
+			transport.Proxy = http.ProxyURL(c.proxy)
+		}
+		c.httpClient = &http.Client{Transport: transport}
+	}
+	return c.httpClient
+}
+
+// openHTTPUpstream fetches the http-flv URL that temporarily replaces the
+// ws connection and returns the streaming response body.
+func (c *client) openHTTPUpstream(result *stream.ExtractResult) (io.ReadCloser, error) {
+	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.openHTTPUpstream")
+	req, err := http.NewRequest(http.MethodGet, result.URL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("making fallback request error: %w", err)
+	}
+	// The fallback must leave the same fingerprint as the ws connection:
+	// same User-Agent, same proxy exit, plus whatever headers the extractor
+	// requires for the upstream.
+	if c.header != nil {
+		req.Header = c.header.Clone()
+	}
+	for key, values := range result.Headers {
+		for _, v := range values {
+			req.Header.Add(key, v)
+		}
+	}
+	log.WithField("field", "url").Debugf("opening http-flv fallback: %s", result.URL)
+	resp, err := c.fallbackHTTPClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sending fallback request error: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("fallback upstream rejected: %s", resp.Status)
+	}
+	return resp.Body, nil
 }

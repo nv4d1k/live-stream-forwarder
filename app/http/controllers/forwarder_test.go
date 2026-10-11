@@ -120,7 +120,9 @@ func TestBuildExtractFn_RetryReextracts(t *testing.T) {
 
 // TestBuildExtractFn_FormatMismatchOnRetry verifies that a retry returning a
 // different format than the initial extraction yields an error so the caller
-// can retry instead of switching formats mid-stream.
+// can retry instead of switching formats mid-stream. The flip must be to a
+// genuinely incompatible payload: ws→flv is accepted as a temporary fallback
+// (see TestBuildExtractFn_WSRetryAcceptsFLVFamily), so m3u8 is used here.
 func TestBuildExtractFn_FormatMismatchOnRetry(t *testing.T) {
 	ext := &fakeExtractor{
 		url:     "wss://host/live/test.xs",
@@ -132,8 +134,8 @@ func TestBuildExtractFn_FormatMismatchOnRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first extract: %v", err)
 	}
-	// Flip the upstream URL to a different format on retry.
-	ext.url = "http://host/live/test.flv"
+	// Flip the upstream URL to a different payload format on retry.
+	ext.url = "https://host/live/index.m3u8"
 	if _, err := fn(first); err == nil {
 		t.Fatal("expected format mismatch error on retry, got nil")
 	}
@@ -267,6 +269,104 @@ func TestBuildExtractFn_XSIsFlvFamily(t *testing.T) {
 	}
 	if fmts := ext.lastFormats(); len(fmts) != 2 || fmts[1] != "flv" {
 		t.Errorf("expected retry with initial format flv, got %v", fmts)
+	}
+}
+
+// TestBuildExtractFn_WSRetryAcceptsFLVFamily verifies that a ws stream may
+// temporarily fall back to an http-flv upstream. DouYu's server decides the
+// transport per rate-stream request (p2p field: 10 → wss, 0/2/9 → http
+// .flv/.xs) and flaps between them, while both upstreams carry the same FLV
+// payload to the client. The flv result must be handed to the forwarder
+// instead of being counted toward a format deadlock.
+func TestBuildExtractFn_WSRetryAcceptsFLVFamily(t *testing.T) {
+	ext := &fakeExtractor{
+		url:     "wss://sug.douyu.com/live/123.flv",
+		formats: []string{"flv", "m3u8", "ws"},
+	}
+	fn := buildExtractFn(ext, "flv")
+
+	first, err := fn(nil)
+	if err != nil {
+		t.Fatalf("first extract: %v", err)
+	}
+
+	ext.url = "https://hw-tct.douyucdn2.cn/live/123.flv?txSecret=s"
+	second, err := fn(first)
+	if err != nil {
+		t.Fatalf("flv retry must pass through for a ws stream: %v", err)
+	}
+	if second.URL != ext.url {
+		t.Errorf("unexpected retry url %q, want %q", second.URL, ext.url)
+	}
+
+	// The .xs (p2p=2) variant serves the same http-flv payload.
+	ext.url = "https://hlsh5p2.douyucdn2.cn/live/123.xs?txSecret=s"
+	third, err := fn(second)
+	if err != nil {
+		t.Fatalf("xs retry must pass through for a ws stream: %v", err)
+	}
+	if third.URL != ext.url {
+		t.Errorf("unexpected retry url %q, want %q", third.URL, ext.url)
+	}
+
+	// Every retry still extracts using the resolved initial format.
+	if fmts := ext.lastFormats(); len(fmts) != 3 || fmts[1] != "ws" || fmts[2] != "ws" {
+		t.Errorf("expected retries with initial format ws, got %v", fmts)
+	}
+}
+
+// TestBuildExtractFn_WSRetryStillCountsOtherFormats verifies the ws→flv
+// exception is narrow: a ws stream flipped to m3u8 (a genuinely different
+// payload the hijacked FLV connection cannot serve) still counts toward the
+// format deadlock.
+func TestBuildExtractFn_WSRetryStillCountsOtherFormats(t *testing.T) {
+	ext := &fakeExtractor{
+		url:     "wss://host/live/test.flv",
+		formats: []string{"flv", "m3u8", "ws"},
+	}
+	fn := buildExtractFn(ext, "flv")
+
+	first, err := fn(nil)
+	if err != nil {
+		t.Fatalf("first extract: %v", err)
+	}
+
+	ext.url = "https://host/live/index.m3u8"
+	for i := 0; i < formatDeadlockThreshold; i++ {
+		if _, err := fn(first); err == nil {
+			t.Fatal("expected format mismatch error on m3u8 retry")
+		}
+	}
+	if _, err := fn(first); !errors.Is(err, stream.ErrFormatDeadlock) {
+		t.Fatalf("expected ErrFormatDeadlock after %d m3u8 mismatches, got: %v", formatDeadlockThreshold+1, err)
+	}
+}
+
+// TestBuildExtractFn_WSPassthroughResetsCounter verifies that an accepted
+// flv fallback resets the mismatch counter, so alternating flv/m3u8
+// extractions never accumulate into a deadlock while the stream keeps
+// recovering on the http fallback.
+func TestBuildExtractFn_WSPassthroughResetsCounter(t *testing.T) {
+	ext := &fakeExtractor{
+		url:     "wss://host/live/test.flv",
+		formats: []string{"flv", "m3u8", "ws"},
+	}
+	fn := buildExtractFn(ext, "flv")
+
+	first, err := fn(nil)
+	if err != nil {
+		t.Fatalf("first extract: %v", err)
+	}
+
+	for i := 0; i < formatDeadlockThreshold*3; i++ {
+		ext.url = "https://host/live/index.m3u8"
+		if _, err := fn(first); err == nil {
+			t.Fatal("expected mismatch error on m3u8 retry")
+		}
+		ext.url = "https://host/live/test.flv"
+		if _, err := fn(first); err != nil {
+			t.Fatalf("flv fallback round %d must be accepted: %v", i, err)
+		}
 	}
 }
 

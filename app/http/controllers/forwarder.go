@@ -346,6 +346,8 @@ func Forwarder(c *gin.Context) {
 // A couple of retries absorb transient platform blips; beyond that the
 // platform (e.g. DouYu moving a room to p2p) has switched for good, and the
 // client must reconnect to land in the forwarder matching the new format.
+// The ws→flv pair is exempt from this escalation (see buildExtractFn): the
+// websocket forwarder falls back to the http upstream seamlessly.
 const formatDeadlockThreshold = 3
 
 // applyQualityHint injects the ?quality= query parameter into extractors
@@ -373,11 +375,15 @@ func applyQualityHint(c *gin.Context, ext extractor.Extractor) {
 //
 // On retry (previous!=nil) it re-extracts fresh using the initial format and
 // rejects URLs whose format differs, so a stream never switches between
-// FLV/HLS/WebSocket mid-flight. When the mismatch persists for
-// formatDeadlockThreshold consecutive retries, the error wraps
-// stream.ErrFormatDeadlock: producers then stop looping and close, and the
-// client's reconnect re-dispatches into the forwarder the platform now
-// serves (e.g. websocket for p2p rooms).
+// FLV/HLS/WebSocket mid-flight. One pair is exempt: a ws stream accepts
+// http-flv (.flv/.xs) results, because DouYu's server decides the transport
+// per rate-stream request and flaps between wss (p2p=10) and http
+// (p2p=0/2/9) while both upstreams carry the same FLV payload — the
+// websocket forwarder rides the http upstream until p2p returns. When a
+// mismatch persists for formatDeadlockThreshold consecutive retries, the
+// error wraps stream.ErrFormatDeadlock: producers then stop looping and
+// close, and the client's reconnect re-dispatches into the forwarder the
+// platform now serves (e.g. websocket for p2p rooms).
 func buildExtractFn(ext extractor.Extractor, desiredFormat string) stream.ExtractFunc {
 	var (
 		initialFormat  string
@@ -429,6 +435,18 @@ func buildExtractFn(ext extractor.Extractor, desiredFormat string) stream.Extrac
 			return nil, err
 		}
 		if fmtName != initialFormat {
+			// DouYu p2p flap exception: the rate stream decides the
+			// transport per request (p2p=10 → wss, 0/2/9 → http .flv/.xs)
+			// and the caller cannot pin it, so a ws stream regularly sees
+			// http-flv results while p2p is briefly unavailable. Both
+			// upstreams carry the same FLV payload and the websocket
+			// forwarder can temporarily read the http one, so hand the
+			// result through instead of counting it toward a deadlock; the
+			// forwarder returns to ws on a later re-extraction.
+			if initialFormat == "ws" && fmtName == "flv" {
+				formatMismatch = 0
+				return r, nil
+			}
 			formatMismatch++
 			if formatMismatch > formatDeadlockThreshold {
 				log := global.Log.WithField("func", "app.http.controllers.buildExtractFn")

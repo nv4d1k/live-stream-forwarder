@@ -126,6 +126,7 @@ Without the parameter the highest available resolution is served — on the defa
 ## Features
 
 - **Seamless 403 recovery**: When an upstream stream URL expires (HTTP 403), the forwarder automatically re-extracts a fresh URL and reconnects — the player never sees a break.
+- **Transport fallback**: DouYu decides per request whether a room is served over p2p (wss) or its http CDN, and flips between them mid-stream. Both carry the same FLV payload, so the WebSocket forwarder transparently rides the http upstream while p2p is unavailable and returns to wss when it recovers — the player never sees a break or a format change.
 - **Stall watchdogs**: Upstream nodes sometimes stop pushing data while keeping the connection open (e.g. DouYu's xp2p edges after token expiry). Two watchdogs catch this — one for silent connections, one for streams whose data never reaches the client — and reconnect automatically. Long sessions also self-heal expired platform credentials.
 - **Proactive token refresh**: For platforms with expiring URLs (e.g. Kick's JWT-signed playback URL, DouYu's 5-minute ws tokens), the HLS and WebSocket forwarders proactively re-extract before the token expires, avoiding playback interruptions entirely.
 - **Best quality by default**: HLS streams automatically select the highest bandwidth variant; YouTube's default SABR channel serves every resolution the room provides (1440p60/2160p60 included) as a remuxed MKV.
