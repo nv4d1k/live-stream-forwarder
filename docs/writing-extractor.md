@@ -32,6 +32,7 @@ type Result struct {
     Headers         http.Header
     ExpireAt        *time.Time // when the URL expires; nil means unknown or no expiry
     VariantSelector any        // optional func([]*libm3u8.Variant) *libm3u8.Variant; used by the HLS forwarder
+    Sabr            *SabrInfo  // YouTube SABR only: ustreamer config + selected itags; nil for every other stream kind
 }
 ```
 

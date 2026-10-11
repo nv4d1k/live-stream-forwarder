@@ -94,31 +94,32 @@ Available formats by platform:
 | DouYin | flv, m3u8 | flv |
 | Twitch | m3u8 | m3u8 |
 | Kick | m3u8 | m3u8 |
-| YouTube | m3u8, dash | dash |
+| YouTube | m3u8, dash, sabr | sabr |
 
-YouTube defaults to the `dash` format — it forwards the fMP4 DASH representations (audio and video interleaved in one stream, up to 1080p60 and beyond where the stream provides it):
+YouTube defaults to the `sabr` format — it speaks the server-ABR (UMP) protocol upstream and forwards a two-track Matroska stream (VP9 video + AAC audio interleaved in one stream) at **every resolution the room provides, 1440p60 and 2160p60 included**:
 
 ```
 http://<address>:<port>/youtube/WWTcu33u00A
 ```
 
-Pass `?format=m3u8` to switch back to the HLS path (muxed TS variants):
+Pass `?format=dash` for the 1080p60 fMP4 (H.264) path, or `?format=m3u8` for the HLS path (muxed TS variants up to 1080p):
 
 ```
+http://<address>:<port>/youtube/WWTcu33u00A?format=dash
 http://<address>:<port>/youtube/WWTcu33u00A?format=m3u8
 ```
 
-> **Note**: `?quality=` currently applies to the `m3u8` format only; `dash` always picks the highest-bandwidth representations.
+All clients of the same room (and quality) share one upstream session: the first viewer starts it, later viewers attach instantly with a replay of the buffered stream.
 
 ### Quality selection
 
-YouTube streams can be capped at a specific resolution with the `?quality=` query parameter (e.g. `480p` or `480`). The closest variant not exceeding the requested height is picked:
+YouTube streams can be capped at a specific resolution with the `?quality=` query parameter (e.g. `480p` or `480`). The tallest variant not exceeding the requested height is picked:
 
 ```
 http://<address>:<port>/youtube/WWTcu33u00A?quality=720p
 ```
 
-Without the parameter the highest available variant is served (up to 1080p; YouTube's HLS caps at 1080p).
+Without the parameter the highest available resolution is served — on the default `sabr` format this can be 1440p60 or 2160p60. On `sabr` the quality also keys the shared upstream, so two clients asking different qualities never share (or duplicate) an upstream session.
 
 > **Note**: YouTube URLs are bound to the proxy exit IP. Extraction and streaming must go through the same proxy — configure the global `--proxy` flag or pass `?proxy=` on the request (mandatory from mainland China).
 
@@ -127,7 +128,8 @@ Without the parameter the highest available variant is served (up to 1080p; YouT
 - **Seamless 403 recovery**: When an upstream stream URL expires (HTTP 403), the forwarder automatically re-extracts a fresh URL and reconnects — the player never sees a break.
 - **Stall watchdogs**: Upstream nodes sometimes stop pushing data while keeping the connection open (e.g. DouYu's xp2p edges after token expiry). Two watchdogs catch this — one for silent connections, one for streams whose data never reaches the client — and reconnect automatically. Long sessions also self-heal expired platform credentials.
 - **Proactive token refresh**: For platforms with expiring URLs (e.g. Kick's JWT-signed playback URL, DouYu's 5-minute ws tokens), the HLS and WebSocket forwarders proactively re-extract before the token expires, avoiding playback interruptions entirely.
-- **Best quality by default**: HLS streams automatically select the highest bandwidth variant. BiliBili uses the v1 API first for higher quality before falling back to v2.
+- **Best quality by default**: HLS streams automatically select the highest bandwidth variant; YouTube's default SABR channel serves every resolution the room provides (1440p60/2160p60 included) as a remuxed MKV.
+- **Shared upstream fan-out**: All clients watching the same YouTube room share one upstream session — one extraction, one upstream connection, one proxy's worth of bandwidth, regardless of viewer count; late joiners replay the buffered stream instantly.
 - **FLV header caching**: Late-joining clients receive a cached FLV header before live data, enabling mid-stream connections without player errors.
 - **No re-encoding**: Streams are forwarded as-is, keeping latency minimal.
 
