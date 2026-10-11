@@ -45,6 +45,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Install the exact toolchain from go.mod up front: without this the
+      # runner's preinstalled Go triggered a runtime toolchain download
+      # from proxy.golang.org on every matrix job, and the v0.11.0
+      # darwin/amd64 build died mid-download on an HTTP/2 INTERNAL_ERROR.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
       - name: Set version info
         run: |
           echo "APP_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
