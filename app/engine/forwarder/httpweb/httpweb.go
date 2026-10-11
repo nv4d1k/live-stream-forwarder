@@ -21,7 +21,7 @@ func NewHTTPWebForwarder(proxy *url.URL, userAgent string) *HTTPWebForwarder {
 	log.Debugln("creating HTTPWebForwarder")
 	h := new(HTTPWebForwarder)
 	h.Client = &http.Client{}
-	h.Client.Transport = NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, userAgent)
+	h.Client.Transport = NewAddHeaderTransport(NewStreamTransport(proxy), userAgent)
 	return h
 }
 

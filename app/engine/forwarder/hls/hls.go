@@ -23,11 +23,7 @@ func NewHLSForwarder(proxy *url.URL, userAgent string) *HLSForwarder {
 		hc:        &http.Client{},
 		userAgent: userAgent,
 	}
-	if proxy != nil {
-		h.hc.Transport = httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxy)}, userAgent)
-	} else {
-		h.hc.Transport = httpweb.NewAddHeaderTransport(nil, userAgent)
-	}
+	h.hc.Transport = httpweb.NewAddHeaderTransport(httpweb.NewStreamTransport(proxy), userAgent)
 	return h
 }
 

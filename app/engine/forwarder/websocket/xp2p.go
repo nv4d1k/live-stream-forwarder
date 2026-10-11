@@ -18,6 +18,7 @@ import (
 
 	ws "github.com/gorilla/websocket"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/flv"
+	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/httpweb"
 	"github.com/nv4d1k/live-stream-forwarder/app/engine/forwarder/stream"
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
@@ -765,11 +766,7 @@ func isHTTPFLVURL(u string) bool {
 // goroutine (the only caller of reconnect), so the lazy init needs no lock.
 func (c *client) fallbackHTTPClient() *http.Client {
 	if c.httpClient == nil {
-		transport := &http.Transport{}
-		if c.proxy != nil {
-			transport.Proxy = http.ProxyURL(c.proxy)
-		}
-		c.httpClient = &http.Client{Transport: transport}
+		c.httpClient = &http.Client{Transport: httpweb.NewStreamTransport(c.proxy)}
 	}
 	return c.httpClient
 }

@@ -49,19 +49,15 @@ type Link struct {
 func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 	log := global.Log.WithField("func", "app.engine.extractor.DouYu.NewDouyuLink")
 	log.WithField("rid", rid).Infoln("creating DouYu extractor")
-	var (
-		err      error
-		proxyURL *url.URL
-	)
 	dy := new(Link)
 	dy.t10 = strconv.Itoa(int(time.Now().Unix()))
 	dy.t13 = strconv.Itoa(int(time.Now().UnixMilli()))
-	if proxy != nil {
-		dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(&http.Transport{Proxy: http.ProxyURL(proxyURL)}, "")}
-		dy.proxy = proxyURL
-	} else {
-		dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(nil, "")}
-	}
+	// The extractor also fetches from p2p edge hosts (xp2p_api_domain), whose
+	// TLS stacks reject ClientHellos without static-RSA suites — hence the
+	// shared stream transport rather than a default one.
+	dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(httpweb.NewStreamTransport(proxy), "")}
+	dy.proxy = proxy
+	var err error
 	dy.streamParams, err = dy.getLegacyFirstStreamParameters(rid)
 	if err != nil {
 		log.WithError(err).Errorln("failed to get stream parameters")
