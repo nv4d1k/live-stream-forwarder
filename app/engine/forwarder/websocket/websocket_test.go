@@ -1037,6 +1037,151 @@ func TestCloseUnblocksHTTPFallback(t *testing.T) {
 	}
 }
 
+// httpFLVDeadEdge accepts the request, serves the FLV header, then goes
+// silent without closing — the exact failure mode of DouYu's hw-h5 line on
+// 2026-10-12: the fallback rides what looks like a live upstream while
+// nothing consumable ever reaches the pipe. The flush is what makes it a
+// dead edge rather than a stalled-header edge: without it the response
+// headers never leave the server and the case collapses into the
+// ResponseHeaderTimeout test in httpweb.
+func httpFLVDeadEdge(t *testing.T) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "video/x-flv")
+		w.Write(append([]byte("FLV\x01\x00\x00\x00\x00\x09"), []byte{0, 0, 0, 0}...))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv
+}
+
+// httpFLVThenSilent streams a complete FLV chunk plus a burst of media tags
+// and then goes silent without closing, simulating a CDN edge that dies
+// mid-stream after having delivered data.
+func httpFLVThenSilent(t *testing.T, payload byte) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "video/x-flv")
+		w.Write(flvChunkWith(payload))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		for i := 0; i < 10; i++ {
+			if _, err := w.Write(flvTagWith(payload)); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv
+}
+
+// TestHTTPFallbackBailsOnDeadEdge is the regression for the 2026-10-12
+// incident: a p2p flip landed the fallback on a dead CDN edge that served
+// the FLV header and then went silent, and the client rode it for the full
+// message-watchdog window (30s) — longer than the player's buffer. The
+// fallback must bail within the first-data window and re-extract, re-rolling
+// the CDN dice.
+func TestHTTPFallbackBailsOnDeadEdge(t *testing.T) {
+	wsSrv := wsStallServer(t)
+	deadSrv := httpFLVDeadEdge(t)
+	healthySrv := httpFLVForever(t, 0x99)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		switch calls.Add(1) {
+		case 1:
+			return &stream.ExtractResult{URL: wsURL(wsSrv)}, nil
+		case 2:
+			return &stream.ExtractResult{URL: deadSrv.URL + "/live/room.flv"}, nil
+		default:
+			return &stream.ExtractResult{URL: healthySrv.URL + "/live/room.flv"}, nil
+		}
+	}, nil, nil, "").(*client)
+	cl.watchdog = 100 * time.Millisecond
+	cl.fallbackFirstDataTimeout = 200 * time.Millisecond
+	cl.fallbackIdleTimeout = 300 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	start := time.Now()
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	out, err := readUntil(t, cl, "\x99", 3*time.Second)
+	if err != nil {
+		t.Fatalf("client did not recover from the dead fallback edge: %v (got %q)", err, out)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Errorf("recovery took %s, want a fast first-data bail-out (200ms window + backoff)", elapsed)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("extractFn called %d times, want 3", got)
+	}
+}
+
+// TestHTTPFallbackBailsOnMidStreamSilence verifies the idle cap: an edge
+// that delivered data and then went silent mid-stream is dropped within the
+// fallback idle window instead of starving the client.
+func TestHTTPFallbackBailsOnMidStreamSilence(t *testing.T) {
+	wsSrv := wsStallServer(t)
+	silentSrv := httpFLVThenSilent(t, 0xAA)
+	healthySrv := httpFLVForever(t, 0xBB)
+
+	var calls atomic.Int32
+	cl := NewXP2PClientWithRetry(func(*stream.ExtractResult) (*stream.ExtractResult, error) {
+		switch calls.Add(1) {
+		case 1:
+			return &stream.ExtractResult{URL: wsURL(wsSrv)}, nil
+		case 2:
+			return &stream.ExtractResult{URL: silentSrv.URL + "/live/room.flv"}, nil
+		default:
+			return &stream.ExtractResult{URL: healthySrv.URL + "/live/room.flv"}, nil
+		}
+	}, nil, nil, "").(*client)
+	cl.watchdog = 100 * time.Millisecond
+	cl.fallbackFirstDataTimeout = 200 * time.Millisecond
+	cl.fallbackIdleTimeout = 300 * time.Millisecond
+	cl.backoffs = []time.Duration{5 * time.Millisecond}
+	defer cl.Close()
+
+	start := time.Now()
+	if err := cl.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// The burst from the silent edge (payload 0xAA) arrives first, then the
+	// edge stalls; the idle cap must move the stream onto the healthy edge.
+	out, err := readUntil(t, cl, "\xBB", 3*time.Second)
+	if err != nil {
+		t.Fatalf("client did not move on from the silent edge: %v (got %q)", err, out)
+	}
+	if !strings.Contains(out, "\xAA") {
+		t.Error("expected the silent edge's burst to have been delivered first")
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Errorf("recovery took %s, want a fast idle bail-out (300ms window + backoff)", elapsed)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("extractFn called %d times, want 3", got)
+	}
+}
+
 // TestIsHTTPFLVURL verifies the classification of fallback-capable upstreams:
 // only http(s) .flv/.xs URLs carry the FLV payload a ws stream can ride.
 func TestIsHTTPFLVURL(t *testing.T) {

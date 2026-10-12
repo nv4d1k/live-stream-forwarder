@@ -51,6 +51,18 @@ const (
 	minReadDeadline = 5 * time.Second
 	// dialTimeout bounds each (re)connect handshake.
 	dialTimeout = 15 * time.Second
+	// defaultFallbackFirstData bounds how long a freshly opened http-flv
+	// fallback may take to deliver its first consumable data (media bytes
+	// past the FLV header reaching the pipe). DouYu's hw-h5 line was
+	// observed on 2026-10-12 accepting a fallback connection, serving the
+	// FLV header and then going silent; riding such an edge for the full
+	// message watchdog window starved the player's buffer and broke the
+	// stream. Bailing out early re-extracts, re-rolling the CDN dice.
+	defaultFallbackFirstData = 5 * time.Second
+	// defaultFallbackIdle caps mid-stream silence once the fallback has
+	// delivered data. A live http-flv edge emits data continuously at the
+	// stream bitrate, so anything near this bound is a dead edge.
+	defaultFallbackIdle = 10 * time.Second
 )
 
 // defaultReconnectBackoffs is the sleep schedule between failed reconnect
@@ -200,6 +212,16 @@ type client struct {
 	refreshLead       time.Duration // how long before ExpireAt to swap in a fresh URL
 	backoffs          []time.Duration
 	maxReconnectFails int
+
+	// http-flv fallback fast-bail tuning. Zero values fall back to the
+	// package defaults; tests override these to keep the suite fast.
+	fallbackFirstDataTimeout time.Duration // max wait for the first consumable data after the fallback opens
+	fallbackIdleTimeout      time.Duration // max mid-stream pipe-write silence before the fallback is dropped
+	// fallbackBasePipeNano is the pipeWriteNano snapshot taken when the
+	// fallback opens (right after the pre-mark). While the counter still
+	// equals it, no media byte has reached the pipe and the first-data
+	// window governs. ReadLoop goroutine only.
+	fallbackBasePipeNano int64
 }
 
 // watchdogDuration returns the effective no-data timeout.
@@ -520,8 +542,13 @@ func (c *client) readHTTPFallback(body io.ReadCloser) bool {
 	log := global.Log.WithField("func", "app.engine.forwarder.websocket.client.readHTTPFallback")
 	// Force-close this body when the next deadline expires, unblocking the
 	// read below. The timer captures the local body, never c.httpBody, so it
-	// can never kill a source a reconnect has already swapped in.
-	timer := time.AfterFunc(time.Until(c.readDeadline()), func() {
+	// can never kill a source a reconnect has already swapped in. The
+	// fallback deadlines (first data / idle) are tighter than the ws
+	// watchdog: a dead edge must be dropped fast, before the player's
+	// buffer runs dry.
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(time.Until(c.fallbackReadDeadline()), func() {
+		timedOut.Store(true)
 		body.Close()
 	})
 	buf := make([]byte, 65536)
@@ -542,11 +569,19 @@ func (c *client) readHTTPFallback(body io.ReadCloser) bool {
 		}
 	}
 	if err != nil {
-		// The body ended: the refresh timer closed it at the proactive
-		// refresh point, the watchdog declared it stalled, or the CDN cut
-		// the connection. Re-extract: if p2p is back the client returns to
-		// ws, otherwise it keeps riding the http fallback.
-		log.WithField("field", "http fallback").Debugf("http upstream ended: %s", err.Error())
+		if timedOut.Load() {
+			// The fallback watchdog closed the body: the edge never
+			// delivered (or stopped delivering) consumable data. Re-extract
+			// now — every extraction re-rolls the CDN line dice, so a dead
+			// edge costs seconds, not the full message watchdog.
+			log.Warn("silent http-flv edge: no data within the fallback deadline, re-extracting to re-roll the CDN line")
+		} else {
+			// The body ended naturally: the CDN cut the connection or the
+			// proactive refresh timer closed it. Re-extract: if p2p is back
+			// the client returns to ws, otherwise it keeps riding the
+			// fallback.
+			log.WithField("field", "http fallback").Debugf("http upstream ended: %s", err.Error())
+		}
 		return c.reconnect()
 	}
 	// Positive refresh check, same as the ws path: swap in a fresh URL at
@@ -588,6 +623,55 @@ func (c *client) readDeadline() time.Time {
 		return deadline
 	}
 	fallback := c.watchdogDuration()
+	if fallback > minReadDeadline {
+		fallback = minReadDeadline
+	}
+	return now.Add(fallback)
+}
+
+// fallbackFirstDataDuration returns the effective first-data window.
+func (c *client) fallbackFirstDataDuration() time.Duration {
+	if c.fallbackFirstDataTimeout > 0 {
+		return c.fallbackFirstDataTimeout
+	}
+	return defaultFallbackFirstData
+}
+
+// fallbackIdleDuration returns the effective mid-stream idle cap.
+func (c *client) fallbackIdleDuration() time.Duration {
+	if c.fallbackIdleTimeout > 0 {
+		return c.fallbackIdleTimeout
+	}
+	return defaultFallbackIdle
+}
+
+// fallbackReadDeadline returns when the next fallback Read must give up.
+// Unlike the ws path's three-cap readDeadline, the http-flv fallback is a
+// continuous byte stream: it must deliver its first consumable data (a media
+// byte past the FLV header reaching the pipe) within the first-data window
+// of opening, and then keep pipe writes flowing at least every idle window —
+// a dead edge that serves the header and stalls (DouYu hw-h5, 2026-10-12)
+// must be dropped in seconds, not after the 30s message watchdog. The
+// proactive refresh point still applies. Deadlines in the past collapse to a
+// capped slice of the first-data window so the loop cannot spin.
+func (c *client) fallbackReadDeadline() time.Time {
+	now := time.Now()
+	var deadline time.Time
+	if c.pipeWriteNano.Load() == c.fallbackBasePipeNano {
+		// No consumable data since the fallback opened: first-data phase.
+		deadline = now.Add(c.fallbackFirstDataDuration())
+	} else {
+		deadline = c.lastPipeWrite().Add(c.fallbackIdleDuration())
+	}
+	if c.previous != nil && c.previous.ExpireAt != nil {
+		if refresh := c.previous.ExpireAt.Add(-c.refreshLeadDuration()); refresh.Before(deadline) {
+			deadline = refresh
+		}
+	}
+	if deadline.After(now) {
+		return deadline
+	}
+	fallback := c.fallbackFirstDataDuration()
 	if fallback > minReadDeadline {
 		fallback = minReadDeadline
 	}
@@ -695,6 +779,10 @@ func (c *client) reconnect() bool {
 				// Give the fresh source a full pipe-watchdog window before
 				// the previous source's stall expires the deadline.
 				c.markPipeWrite()
+				// Snapshot the pipe-write counter after the pre-mark: the
+				// first media byte moving it past this baseline ends the
+				// first-data phase.
+				c.fallbackBasePipeNano = c.pipeWriteNano.Load()
 				log.WithField("field", "attempt").Warnf("p2p unavailable, riding http-flv upstream (attempt %d)", fails+1)
 				return true
 			}
