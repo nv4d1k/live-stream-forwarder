@@ -26,6 +26,25 @@ func init() {
 	})
 }
 
+// apiTimeout bounds every extractor API request (rate stream, device id,
+// encryption data). Without it a stalled connection hangs the caller for as
+// long as the OS keeps the socket — observed on 2026-10-12 as a rate stream
+// POST hanging 15.6s, blowing the reconnect budget and answering the
+// player's fresh request with a 400.
+const apiTimeout = 10 * time.Second
+
+// newExtractorClient builds the http.Client for the DouYu API calls:
+// proxy-aware, CDN-TLS capable (the extractor also fetches from p2p edge
+// hosts) and bounded by timeout.
+func newExtractorClient(proxy *url.URL, timeout time.Duration) *http.Client {
+	log := global.Log.WithField("func", "app.engine.extractor.DouYu.newExtractorClient")
+	log.Debugln("creating extractor client")
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: httpweb.NewAddHeaderTransport(httpweb.NewStreamTransport(proxy), ""),
+	}
+}
+
 type Link struct {
 	rid          string
 	did          string
@@ -55,7 +74,7 @@ func NewDouyuLink(rid string, proxy *url.URL) (*Link, error) {
 	// The extractor also fetches from p2p edge hosts (xp2p_api_domain), whose
 	// TLS stacks reject ClientHellos without static-RSA suites — hence the
 	// shared stream transport rather than a default one.
-	dy.client = &http.Client{Transport: httpweb.NewAddHeaderTransport(httpweb.NewStreamTransport(proxy), "")}
+	dy.client = newExtractorClient(proxy, apiTimeout)
 	dy.proxy = proxy
 	var err error
 	dy.streamParams, err = dy.getLegacyFirstStreamParameters(rid)

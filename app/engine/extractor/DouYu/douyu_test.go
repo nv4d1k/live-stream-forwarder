@@ -4,6 +4,8 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -15,6 +17,29 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
+
+// TestNewExtractorClientBoundsStalledRequests pins the API client timeout:
+// a stalled API server must fail within the client timeout instead of
+// hanging the caller. On 2026-10-12 a flaky network hung a rate stream POST
+// for 15.6s, blowing the reconnect budget and answering the player's fresh
+// request with a 400.
+func TestNewExtractorClientBoundsStalledRequests(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // stall past the client timeout
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	start := time.Now()
+	_, err := newExtractorClient(nil, 80*time.Millisecond).Get(srv.URL)
+	if err == nil {
+		t.Fatal("expected the stalled request to fail within the client timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("stalled request took %s to fail, want it bounded near the client timeout", elapsed)
+	}
+}
 
 func TestMain(m *testing.M) {
 	global.Log = logrus.New()
