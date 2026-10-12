@@ -2,8 +2,10 @@ package httpweb
 
 import (
 	"crypto/tls"
+	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/nv4d1k/live-stream-forwarder/global"
 )
@@ -60,15 +62,36 @@ func StreamTLSConfig() *tls.Config {
 	}
 }
 
+// Stream fetch timeouts: every phase up to the response headers is bounded,
+// while the body is never bounded (it is a live stream). A custom
+// http.Transport leaves all of these zero, so a CDN edge that accepts the
+// connection but never answers — the 2026-10-12 dead-edge incident — would
+// hang the fetching goroutine forever.
+const (
+	// streamDialTimeout bounds the TCP connect, mirroring the ws dialer's
+	// handshake budget.
+	streamDialTimeout = 10 * time.Second
+	// streamTLSHandshakeTimeout bounds the TLS handshake.
+	streamTLSHandshakeTimeout = 10 * time.Second
+	// streamResponseHeaderTimeout bounds the wait for response headers after
+	// the request is written. DouYu's scdn edges answer stream GETs within a
+	// second; anything still silent after this is a dead edge.
+	streamResponseHeaderTimeout = 15 * time.Second
+)
+
 // NewStreamTransport builds the http.Transport shared by the stream
 // forwarders (FLV, HLS and the websocket forwarder's http-flv fallback):
-// proxy-aware and carrying StreamTLSConfig so CDN edges with legacy TLS
-// stacks stay reachable.
+// proxy-aware, carrying StreamTLSConfig so CDN edges with legacy TLS stacks
+// stay reachable, and bounding every pre-header phase so stalled edges fail
+// fast instead of hanging the fetch.
 func NewStreamTransport(proxy *url.URL) *http.Transport {
 	log := global.Log.WithField("func", "app.engine.forwarder.httpweb.NewStreamTransport")
 	log.WithField("field", "proxy").Debugln("creating stream transport")
 	return &http.Transport{
-		Proxy:           http.ProxyURL(proxy),
-		TLSClientConfig: StreamTLSConfig(),
+		Proxy:                 http.ProxyURL(proxy),
+		TLSClientConfig:       StreamTLSConfig(),
+		DialContext:           (&net.Dialer{Timeout: streamDialTimeout}).DialContext,
+		TLSHandshakeTimeout:   streamTLSHandshakeTimeout,
+		ResponseHeaderTimeout: streamResponseHeaderTimeout,
 	}
 }

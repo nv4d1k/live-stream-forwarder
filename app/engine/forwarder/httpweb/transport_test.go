@@ -71,3 +71,23 @@ func TestNewStreamTransportWiresProxyAndTLS(t *testing.T) {
 		t.Fatal("TLSClientConfig missing in direct mode (no-proxy streams hit the same CDN edges)")
 	}
 }
+
+// TestNewStreamTransportBoundsStalledPhases pins the transport timeouts: a
+// custom http.Transport with zero DialContext/TLSHandshakeTimeout/
+// ResponseHeaderTimeout never times out, so a CDN edge that accepts the TCP
+// connection but never answers hangs the fetching goroutine forever — the
+// 2026-10-12 dead-edge incident on the ws→flv fallback path. The timeouts
+// bound everything up to the response headers only; the streamed body is a
+// live stream and must never be bounded by a client timeout.
+func TestNewStreamTransportBoundsStalledPhases(t *testing.T) {
+	tr := NewStreamTransport(nil)
+	if tr.DialContext == nil {
+		t.Error("DialContext missing: a stalled TCP connect would hang forever")
+	}
+	if tr.TLSHandshakeTimeout <= 0 {
+		t.Error("TLSHandshakeTimeout missing: a stalled TLS handshake would hang forever")
+	}
+	if tr.ResponseHeaderTimeout <= 0 {
+		t.Error("ResponseHeaderTimeout missing: an edge that never answers headers would hang forever")
+	}
+}
